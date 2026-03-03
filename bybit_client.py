@@ -115,6 +115,11 @@ class BybitClient:
 
                 ret_code = raw.get("retCode", -1)
                 if ret_code != 0:
+                    # 34040 = "not modified" — trading-stop called with the same SL/TP value.
+                    # This is a no-op success, not a real error.
+                    if ret_code == 34040:
+                        logger.debug(f"Bybit retCode 34040 (not modified) — treating as success")
+                        return raw.get("result", {})
                     raise APIError(
                         message=raw.get("retMsg", "Unknown Bybit API error"),
                         status_code=response.status_code,

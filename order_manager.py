@@ -93,6 +93,13 @@ class OrderManager:
         self._cache = await self._db.get_active_trades()
         if self._cache:
             logger.info(f"Restored {len(self._cache)} trade(s): {', '.join(self._cache)}")
+            # Restore seen_close_orders from DB so partial-close detections survive restarts
+            for trade in self._cache.values():
+                if trade.seen_close_ids:
+                    ids = {s for s in trade.seen_close_ids.split(",") if s}
+                    self._seen_close_orders.update(ids)
+            if self._seen_close_orders:
+                logger.info(f"Restored {len(self._seen_close_orders)} seen close order ID(s) from DB")
         else:
             logger.info("No active trades in DB.")
         # Reconcile any trades that had unfilled limit entries when bot was last stopped
@@ -976,6 +983,16 @@ class OrderManager:
             except Exception as e:
                 logger.error(f"TP fill poller error: {e}", exc_info=True)
 
+    async def _persist_seen_close_id(self, trade: "TradeRecord", order_id: str) -> None:
+        """Add order_id to trade.seen_close_ids and persist to DB."""
+        existing = set(s for s in (trade.seen_close_ids or "").split(",") if s)
+        existing.add(order_id)
+        trade.seen_close_ids = ",".join(existing)
+        try:
+            await self._db.update_seen_close_ids(trade.trade_id, trade.seen_close_ids)
+        except Exception as e:
+            logger.warning(f"[{trade.trade_id}] Failed to persist seen_close_id {order_id}: {e}")
+
     async def _check_tp_fills(self, notify_callback) -> None:
         """
         For each active trade, check if TP1/TP2/TP3 orders have filled.
@@ -1042,6 +1059,7 @@ class OrderManager:
                     # won't re-classify it as an unknown close
                     if order_id:
                         self._seen_close_orders.add(order_id)
+                        await self._persist_seen_close_id(trade, order_id)
                     setattr(trade, order_id_attr, "")
                     await self._db.update_trade(trade)
 
@@ -1194,8 +1212,9 @@ class OrderManager:
 
                     else:
                         # Partial close (e.g. TP hit but position still open)
-                        # Track in memory so we don't re-fire on next poll
+                        # Persist to DB so this order isn't re-detected on restart
                         self._seen_close_orders.add(order_id)
+                        await self._persist_seen_close_id(trade, order_id)
                         logger.info(
                             f"[{trade.trade_id}] {pair} partial close detected "
                             f"@ {fill_price} qty={fill_qty} — position still open"

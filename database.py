@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS trades (
     opened_at       TEXT NOT NULL,
     closed_at       TEXT,
     realized_pnl    REAL NOT NULL DEFAULT 0.0,
-    exit_price      REAL NOT NULL DEFAULT 0.0
+    exit_price      REAL NOT NULL DEFAULT 0.0,
+    seen_close_ids  TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -61,6 +62,10 @@ ALTER TABLE trades ADD COLUMN soft_sl_timeframe TEXT;
 
 MIGRATE_ADD_STRATEGY = """
 ALTER TABLE trades ADD COLUMN strategy TEXT;
+"""
+
+MIGRATE_ADD_SEEN_CLOSE_IDS = """
+ALTER TABLE trades ADD COLUMN seen_close_ids TEXT NOT NULL DEFAULT '';
 """
 
 # SQLite cannot ALTER COLUMN to drop NOT NULL constraints.
@@ -95,7 +100,8 @@ CREATE TABLE IF NOT EXISTS trades_new (
     opened_at       TEXT NOT NULL,
     closed_at       TEXT,
     realized_pnl    REAL NOT NULL DEFAULT 0.0,
-    exit_price      REAL NOT NULL DEFAULT 0.0
+    exit_price      REAL NOT NULL DEFAULT 0.0,
+    seen_close_ids  TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -131,6 +137,7 @@ def _row_to_trade(row: aiosqlite.Row) -> TradeRecord:
         closed_at=datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else None,
         realized_pnl=row["realized_pnl"],
         exit_price=row["exit_price"],
+        seen_close_ids=row["seen_close_ids"] if "seen_close_ids" in keys else "",
     )
 
 
@@ -150,7 +157,8 @@ class Database:
             (MIGRATE_ADD_POSITION_ID, 'position_id'),
             (MIGRATE_ADD_SOFT_SL,     'soft_sl_price'),
             (MIGRATE_ADD_SOFT_SL_TF,  'soft_sl_timeframe'),
-            (MIGRATE_ADD_STRATEGY,    'strategy'),
+            (MIGRATE_ADD_STRATEGY,       'strategy'),
+            (MIGRATE_ADD_SEEN_CLOSE_IDS, 'seen_close_ids'),
         ]:
             try:
                 await self._db.execute(migration)
@@ -212,13 +220,13 @@ class Database:
                     position_size, leverage, risk_amount, balance_at_entry,
                     status, dca, entry_order_id, sl_order_id,
                     tp1_order_id, tp2_order_id, tp3_order_id, dca_order_id,
-                    position_id, soft_sl_price, soft_sl_timeframe, strategy, opened_at, closed_at, realized_pnl, exit_price
+                    position_id, soft_sl_price, soft_sl_timeframe, strategy, opened_at, closed_at, realized_pnl, exit_price, seen_close_ids
                 ) VALUES (
                     :trade_id, :pair, :side, :entry, :sl, :tp1, :tp2, :tp3,
                     :position_size, :leverage, :risk_amount, :balance_at_entry,
                     :status, :dca, :entry_order_id, :sl_order_id,
                     :tp1_order_id, :tp2_order_id, :tp3_order_id, :dca_order_id,
-                    :position_id, :soft_sl_price, :soft_sl_timeframe, :strategy, :opened_at, :closed_at, :realized_pnl, :exit_price
+                    :position_id, :soft_sl_price, :soft_sl_timeframe, :strategy, :opened_at, :closed_at, :realized_pnl, :exit_price, :seen_close_ids
                 )
                 """,
                 {
@@ -250,6 +258,7 @@ class Database:
                     "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
                     "realized_pnl": trade.realized_pnl,
                     "exit_price": trade.exit_price,
+                    "seen_close_ids": trade.seen_close_ids or "",
                 },
             )
             await self._db.commit()
@@ -299,6 +308,15 @@ class Database:
             )
             await self._db.commit()
             logger.debug(f"Updated trade {trade.trade_id}")
+
+    async def update_seen_close_ids(self, trade_id: str, seen_ids: str) -> None:
+        """Persist the seen_close_ids string for a trade (comma-separated order IDs)."""
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE trades SET seen_close_ids = ? WHERE trade_id = ?",
+                (seen_ids, trade_id),
+            )
+            await self._db.commit()
 
     async def mark_closed(
         self,

@@ -97,6 +97,7 @@ class TradeRecord:
     closed_at: Optional[datetime] = None
     realized_pnl: float = 0.0
     exit_price: float = 0.0
+    seen_close_ids: str = ""  # comma-separated order IDs of processed partial closes
 
 
 @dataclass
