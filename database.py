@@ -20,10 +20,10 @@ CREATE TABLE IF NOT EXISTS trades (
     pair            TEXT NOT NULL,
     side            TEXT NOT NULL,
     entry           REAL NOT NULL,
-    sl              REAL NOT NULL,
-    tp1             REAL NOT NULL,
-    tp2             REAL NOT NULL,
-    tp3             REAL NOT NULL,
+    sl              REAL,
+    tp1             REAL,
+    tp2             REAL,
+    tp3             REAL,
     position_size   REAL NOT NULL,
     leverage        INTEGER NOT NULL,
     risk_amount     REAL NOT NULL,
@@ -61,6 +61,42 @@ ALTER TABLE trades ADD COLUMN soft_sl_timeframe TEXT;
 
 MIGRATE_ADD_STRATEGY = """
 ALTER TABLE trades ADD COLUMN strategy TEXT;
+"""
+
+# SQLite cannot ALTER COLUMN to drop NOT NULL constraints.
+# We recreate the trades table preserving all data, with tp1/tp2/tp3/sl nullable.
+# This runs once — guarded by checking if tp1 still has a NOT NULL constraint.
+MIGRATE_NULLABLE_TPS = """
+CREATE TABLE IF NOT EXISTS trades_new (
+    trade_id        TEXT PRIMARY KEY,
+    pair            TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    entry           REAL NOT NULL,
+    sl              REAL,
+    tp1             REAL,
+    tp2             REAL,
+    tp3             REAL,
+    position_size   REAL NOT NULL,
+    leverage        INTEGER NOT NULL,
+    risk_amount     REAL NOT NULL,
+    balance_at_entry REAL NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'open',
+    dca             REAL,
+    entry_order_id  TEXT,
+    sl_order_id     TEXT,
+    tp1_order_id    TEXT,
+    tp2_order_id    TEXT,
+    tp3_order_id    TEXT,
+    dca_order_id    TEXT,
+    position_id     TEXT,
+    soft_sl_price       REAL,
+    soft_sl_timeframe   TEXT,
+    strategy            TEXT,
+    opened_at       TEXT NOT NULL,
+    closed_at       TEXT,
+    realized_pnl    REAL NOT NULL DEFAULT 0.0,
+    exit_price      REAL NOT NULL DEFAULT 0.0
+);
 """
 
 
@@ -122,6 +158,22 @@ class Database:
                 logger.info(f'DB migration: added {label} column')
             except Exception:
                 pass  # column already exists
+        # Migrate: drop NOT NULL from tp1/tp2/tp3/sl if still present.
+        # SQLite can't ALTER COLUMN — we recreate the table preserving all data.
+        try:
+            cur = await self._db.execute("PRAGMA table_info(trades)")
+            cols = await cur.fetchall()
+            tp1_notnull = any(c["name"] == "tp1" and c["notnull"] == 1 for c in cols)
+            if tp1_notnull:
+                logger.info("DB migration: removing NOT NULL from tp1/tp2/tp3/sl ...")
+                await self._db.execute(MIGRATE_NULLABLE_TPS)
+                await self._db.execute("INSERT INTO trades_new SELECT * FROM trades")
+                await self._db.execute("DROP TABLE trades")
+                await self._db.execute("ALTER TABLE trades_new RENAME TO trades")
+                await self._db.commit()
+                logger.info("DB migration: tp1/tp2/tp3/sl are now nullable")
+        except Exception as e:
+            logger.warning(f"DB migration (nullable TPs) failed: {e}")
         # Retroactively mark resync ghost records as 'dropped' so they
         # don't pollute /history or /stats (exit_price=0, pnl=0 = never really closed)
         await self._db.execute(
