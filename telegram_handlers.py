@@ -12,7 +12,7 @@ from telegram.warnings import PTBUserWarning
 
 import messages as M
 from messages import _fmt  # price formatter — no trailing zeros, no sci notation
-from bitunix_client import BitunixClient
+from bybit_client import BybitClient
 from config import AUTHORIZED_USER_ID, DEBUG_MODE
 from database import Database
 from journal import Journal
@@ -85,7 +85,7 @@ def _trail(d: dict) -> str:
 class BotHandlers:
     def __init__(
         self,
-        client: BitunixClient,
+        client: BybitClient,
         order_manager: OrderManager,
         risk_manager: RiskManager,
         journal: Journal,
@@ -930,39 +930,18 @@ class BotHandlers:
         try:
             pos_list      = await self._client.get_positions()
             active_trades = await self._db.get_active_trades()
-
-            # Fetch native TPSL orders once — contains exchange SL/TP prices
-            try:
-                all_tpsl = await self._client.get_pending_tpsl()
-            except Exception:
-                all_tpsl = []
-
-            # Build symbol → native slPrice map from TPSL endpoint
-            tpsl_sl_by_symbol: dict[str, float] = {}
-            for o in all_tpsl:
-                sym = o.get("symbol", "")
-                if not sym:
-                    continue
-                try:
-                    sl_val = float(o.get("slPrice", 0) or 0)
-                except (ValueError, TypeError):
-                    sl_val = 0.0
-                if sl_val > 0:
-                    tpsl_sl_by_symbol[sym] = sl_val
-
-            # Classify live pending orders per position for accurate TP/DCA/SL display
+            # Classify live pending orders per position for accurate TP/DCA/SL display.
+            # On Bybit, SL lives in position data (stop_loss field), not a separate order.
             classified: dict[str, dict] = {}
             for pos in pos_list:
                 is_long = pos.side.upper() == "LONG"
                 result = await self._om.classify_orders(
                     pos.symbol, pos.entry_price, is_long
                 )
-                # Inject native TPSL stop price so messages.py can display it
-                # even when there is no bot-tracked trade record for this position
-                if pos.symbol in tpsl_sl_by_symbol:
-                    result["native_sl"] = tpsl_sl_by_symbol[pos.symbol]
+                # Inject native SL so messages.py can show it even without a bot trade record
+                if pos.stop_loss and pos.stop_loss > 0:
+                    result["native_sl"] = pos.stop_loss
                 classified[pos.symbol] = result
-
             await msg.edit_text(
                 M.positions(pos_list, active_trades, classified),
                 parse_mode="HTML"
@@ -1626,11 +1605,10 @@ class BotHandlers:
     @auth_required
     async def cmd_tp(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
-        Add a take-profit order to a tracked trade.
+        Add a take-profit limit order to a tracked trade.
         Usage:
           /tp PAIR PRICE QTY   — limit TP at PRICE for QTY tokens
-          /tp PAIR cmp QTY     — market close QTY tokens at current price
-        Omit QTY to see position info first.
+          /tp PAIR cmp QTY     — market close QTY tokens now
         """
         sep  = "─" * 28
         args = context.args or []
@@ -1640,9 +1618,8 @@ class BotHandlers:
                 f"<b>ADD TAKE PROFIT</b>\n"
                 f"<code>{sep}</code>\n\n"
                 f"  <code>/tp PAIR PRICE QTY</code>   — limit TP\n"
-                f"  <code>/tp PAIR cmp QTY</code>     — market close (fill now)\n\n"
-                f"  <b>QTY</b>  is the number of tokens to close at this TP.\n"
-                f"  Omit QTY to see current position size first.",
+                f"  <code>/tp PAIR cmp QTY</code>     — market close now\n\n"
+                f"  <b>QTY</b> is the number of tokens to close at this TP.",
                 parse_mode="HTML",
             )
             return
@@ -1673,7 +1650,6 @@ class BotHandlers:
                 )
                 return
 
-        # Validate price direction for limit orders
         if not is_market and trade.entry > 0:
             if trade.side == Side.LONG and price <= trade.entry:
                 await update.message.reply_text(
@@ -1702,7 +1678,6 @@ class BotHandlers:
                 )
                 return
         else:
-            # No qty — show position info so user can decide
             await update.message.reply_text(
                 f"<b>ADD TP — {pair}</b>\n"
                 f"<code>{sep}</code>\n\n"
@@ -1730,17 +1705,16 @@ class BotHandlers:
             f"<code>{sep}</code>\n\n"
             f"  <code>Price  </code>  {price_label}\n"
             f"  <code>Qty    </code>  {qty} tokens\n\n"
-            f"  Which TP slot should this be assigned to?",
+            f"  Which TP slot?",
             parse_mode="HTML",
             reply_markup=kb,
         )
 
     @auth_required
     async def _handle_addtp(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Callback for TP slot selection buttons from /tp command."""
         query = update.callback_query
         await query.answer()
-        data = query.data  # addtp:PAIR:PRICE:QTY:SLOT  or  addtp:cancel
+        data = query.data
 
         if data == "addtp:cancel":
             await query.edit_message_text("<b>TP ORDER CANCELLED</b>", parse_mode="HTML")
@@ -1783,9 +1757,6 @@ class BotHandlers:
         """
         Add a DCA entry to a tracked trade.
         Usage: /dca PAIR PRICE RISK NEW_SL
-          PRICE  — DCA limit entry price
-          RISK   — additional risk as 3% or 150$
-          NEW_SL — new combined stop loss (replaces existing SL on exchange)
         """
         sep  = "─" * 28
         args = context.args or []
@@ -1827,29 +1798,24 @@ class BotHandlers:
             if dca_price <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text(
-                "<b>INVALID PRICE</b>  Enter a positive number.", parse_mode="HTML"
-            )
+            await update.message.reply_text("<b>INVALID PRICE</b>  Enter a positive number.", parse_mode="HTML")
             return
 
         if trade.entry > 0:
             if trade.side == Side.LONG and dca_price >= trade.entry:
                 await update.message.reply_text(
-                    f"<b>INVALID DCA</b>  ${_fmt(dca_price)} must be <b>below</b> "
-                    f"entry ${_fmt(trade.entry)} for a LONG.",
+                    f"<b>INVALID DCA</b>  ${_fmt(dca_price)} must be <b>below</b> entry ${_fmt(trade.entry)} for LONG.",
                     parse_mode="HTML",
                 )
                 return
             if trade.side == Side.SHORT and dca_price <= trade.entry:
                 await update.message.reply_text(
-                    f"<b>INVALID DCA</b>  ${_fmt(dca_price)} must be <b>above</b> "
-                    f"entry ${_fmt(trade.entry)} for a SHORT.",
+                    f"<b>INVALID DCA</b>  ${_fmt(dca_price)} must be <b>above</b> entry ${_fmt(trade.entry)} for SHORT.",
                     parse_mode="HTML",
                 )
                 return
 
         try:
-            from utils import parse_risk
             risk_value, risk_type_str = parse_risk(args[2])
         except ValueError as e:
             await update.message.reply_text(
@@ -1863,22 +1829,18 @@ class BotHandlers:
             if new_sl <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text(
-                "<b>INVALID SL</b>  Enter a positive number.", parse_mode="HTML"
-            )
+            await update.message.reply_text("<b>INVALID SL</b>  Enter a positive number.", parse_mode="HTML")
             return
 
         if trade.side == Side.LONG and new_sl >= dca_price:
             await update.message.reply_text(
-                f"<b>INVALID SL</b>  ${_fmt(new_sl)} must be <b>below</b> "
-                f"DCA price ${_fmt(dca_price)} for a LONG.",
+                f"<b>INVALID SL</b>  ${_fmt(new_sl)} must be <b>below</b> DCA price ${_fmt(dca_price)} for LONG.",
                 parse_mode="HTML",
             )
             return
         if trade.side == Side.SHORT and new_sl <= dca_price:
             await update.message.reply_text(
-                f"<b>INVALID SL</b>  ${_fmt(new_sl)} must be <b>above</b> "
-                f"DCA price ${_fmt(dca_price)} for a SHORT.",
+                f"<b>INVALID SL</b>  ${_fmt(new_sl)} must be <b>above</b> DCA price ${_fmt(dca_price)} for SHORT.",
                 parse_mode="HTML",
             )
             return
@@ -1895,22 +1857,18 @@ class BotHandlers:
 
             stop_distance = abs(dca_price - new_sl)
             if stop_distance == 0:
-                await msg.edit_text(
-                    "<b>INVALID</b>  DCA price and SL price cannot be the same.",
-                    parse_mode="HTML",
-                )
+                await msg.edit_text("<b>INVALID</b>  DCA price and SL price cannot be the same.", parse_mode="HTML")
                 return
 
-            sym_info     = await self._client.get_symbol_info(pair)
-            qp           = sym_info["basePrecision"]
-            min_qty      = sym_info["minTradeVolume"]
-            raw_qty      = risk_amount / stop_distance
-            dca_qty      = round(raw_qty, qp)
+            sym_info  = await self._client.get_symbol_info(pair)
+            qp        = sym_info["basePrecision"]
+            min_qty   = sym_info["minTradeVolume"]
+            raw_qty   = risk_amount / stop_distance
+            dca_qty   = round(raw_qty, qp)
 
             if dca_qty < min_qty:
                 await msg.edit_text(
-                    f"<b>QTY TOO SMALL</b>  Calculated {dca_qty} tokens is below "
-                    f"exchange minimum {min_qty}.\n\n"
+                    f"<b>QTY TOO SMALL</b>  Calculated {dca_qty} tokens is below exchange minimum {min_qty}.\n\n"
                     f"  Increase risk amount or widen the stop distance.",
                     parse_mode="HTML",
                 )
@@ -1945,7 +1903,6 @@ class BotHandlers:
 
     @auth_required
     async def _handle_adddca(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Callback for DCA confirm/cancel button from /dca command."""
         query = update.callback_query
         await query.answer()
         data = query.data

@@ -138,25 +138,22 @@ class RiskManager:
                 f"Reduce risk amount or free up margin."
             )
 
-        # Liquidation price estimate — CROSS margin
-        # In cross margin the entire account balance backs the position.
-        # The position is liquidated when unrealised loss consumes:
-        #   balance - maintenance_margin
-        # where maintenance_margin = notional * mmr
+        # Liquidation price estimate (isolated margin approximation)
+        # Formula: liq = entry * (1 ∓ 1/lev + mmr)
+        # where mmr = maintenance margin rate (~0.5% on Bybit linear)
         #
-        # For LONG:  liq = entry - (balance - notional * mmr) / position_size
-        # For SHORT: liq = entry + (balance - notional * mmr) / position_size
+        # This matches Bybit's isolated-margin liquidation formula and gives
+        # a directionally correct result for cross-margin too. The cross-margin
+        # formula requires total account balance across all positions and is not
+        # reliably calculable here — this is a close approximation.
         #
-        # If multiple positions exist this is approximate (single-position assumption)
-        # but directionally correct and much better than the isolated formula.
-        mmr             = 0.005   # Bitunix default maintenance margin rate ~0.5%
-        notional_full   = position_size * entry_price
-        buffer          = equity - notional_full * mmr      # usable balance before liq
-        buffer          = max(buffer, 0.0)
+        # For LONG:  liq = entry * (1 - 1/lev + mmr)  → below entry
+        # For SHORT: liq = entry * (1 + 1/lev - mmr)  → above entry
+        mmr = 0.005   # Bybit linear maintenance margin rate ~0.5%
         if req.side == Side.LONG:
-            liquidation_price = entry_price - buffer / position_size
+            liquidation_price = entry_price * (1 - 1 / leverage + mmr)
         else:
-            liquidation_price = entry_price + buffer / position_size
+            liquidation_price = entry_price * (1 + 1 / leverage - mmr)
         liquidation_price = max(liquidation_price, 0.0)
 
         risk_percent = (risk_amount / equity) * 100

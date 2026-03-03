@@ -71,9 +71,9 @@ class Journal:
         except Exception as e:
             logger.warning(f"Discord webhook failed: {e}")
 
-    def _fire_and_forget(self, payload: dict) -> None:
-        """Schedule webhook without blocking caller."""
-        asyncio.create_task(self._send_webhook(payload))
+    async def _fire_and_forget(self, payload: dict) -> None:
+        """Directly await the webhook — all callers are already async."""
+        await self._send_webhook(payload)
 
     def _embed(
         self,
@@ -115,7 +115,7 @@ class Journal:
                 self._field("TP3", f"${trade.tp3:,.4f}"),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
 
     async def log_tp_hit(
         self,
@@ -143,7 +143,7 @@ class Journal:
                 self._field("Strategy",     trade.strategy.title() if trade.strategy else "—"),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
         self._write_csv(trade, exit_price=tp_price, reason=f"tp{tp_num}_hit")
 
     async def log_sl_moved_to_be(self, trade: "TradeRecord", old_sl: float) -> None:
@@ -161,7 +161,7 @@ class Journal:
                 self._field("Trigger",  "Auto after TP1" if trade.tp1 else "Manual"),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
 
     async def log_sl_modified(self, trade: "TradeRecord", old_sl: float, new_sl: float) -> None:
         """Fires when SL is manually moved to any price."""
@@ -176,7 +176,7 @@ class Journal:
                 self._field("New SL",  f"${new_sl:,.4f}"),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
 
     async def log_sl_hit(
         self,
@@ -212,7 +212,7 @@ class Journal:
                 self._field("Strategy",     trade.strategy.title() if trade.strategy else "—"),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
         self._write_csv(trade, exit_price=close_price, reason="sl_hit")
 
     async def log_position_closed_externally(
@@ -264,7 +264,7 @@ class Journal:
                 self._field("Strategy",     trade.strategy.title() if trade.strategy else "—"),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
         self._write_csv(trade, exit_price=close_price, reason=reason)
 
     async def log_trade_closed(self, trade: "TradeRecord", reason: str = "manual") -> None:
@@ -286,7 +286,7 @@ class Journal:
                 self._field("Duration", duration or "N/A"),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
         self._write_csv(trade, reason=reason)
 
     async def log_closeall(self, trades: list["TradeRecord"]) -> None:
@@ -300,7 +300,7 @@ class Journal:
                 self._field("Total Realized PnL", f"${total_pnl:.2f}"),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
 
     async def log_soft_sl_breach(
         self,
@@ -328,7 +328,7 @@ class Journal:
                 ),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
 
     async def log_soft_sl_ignored(
         self,
@@ -352,7 +352,7 @@ class Journal:
                 ),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
 
     async def log_rejection(self, pair: str, reason: str) -> None:
         payload = self._embed(
@@ -363,7 +363,7 @@ class Journal:
                 self._field("Reason", reason, inline=False),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
 
     async def log_error(self, error_type: str, pair: str, api_response: str = "") -> None:
         payload = self._embed(
@@ -376,7 +376,7 @@ class Journal:
                 self._field("Timestamp", datetime.utcnow().isoformat()),
             ],
         )
-        self._fire_and_forget(payload)
+        await self._fire_and_forget(payload)
 
     async def close(self) -> None:
         await self._http.aclose()

@@ -236,6 +236,9 @@ class BybitClient:
             margin         = float(p.get("positionIM",    0) or 0),
             # positionIdx is what trading-stop needs as "positionIdx"
             position_id    = str(p.get("positionIdx", 0)),
+            # Native exchange SL/TP set via trading-stop endpoint
+            stop_loss      = float(p.get("stopLoss",   0) or 0),
+            take_profit    = float(p.get("takeProfit", 0) or 0),
         )
 
     async def get_positions(self) -> list["BybitPosition"]:

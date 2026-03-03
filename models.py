@@ -108,7 +108,9 @@ class BybitPosition:
     unrealized_pnl: float
     leverage: int
     margin: float
-    position_id: str = ""   # Bitunix positionId
+    position_id: str = ""   # positionIdx as string
+    stop_loss: float = 0.0  # exchange native SL price (from trading-stop)
+    take_profit: float = 0.0  # exchange native TP price (from trading-stop)
 
 
 class BotException(Exception):
