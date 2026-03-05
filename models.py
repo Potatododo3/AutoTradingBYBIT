@@ -89,7 +89,7 @@ class TradeRecord:
     tp2_order_id: Optional[str] = None
     tp3_order_id: Optional[str] = None
     dca_order_id: Optional[str] = None
-    position_id:        Optional[str]   = None   # Bitunix positionId for native TPSL binding
+    position_id:        Optional[str]   = None   # Bybit positionIdx for trading-stop (always "0" in one-way mode)
     # Soft SL — monitored by SoftSLMonitor, no exchange order placed
     soft_sl_price:      Optional[float] = None   # price level to watch
     soft_sl_timeframe:  Optional[str]   = None   # '15m'|'30m'|'1h'|'4h'|'Daily'
@@ -101,7 +101,7 @@ class TradeRecord:
 
 
 @dataclass
-class BitunixPosition:
+class BybitPosition:
     symbol: str
     side: str
     size: float
@@ -109,7 +109,9 @@ class BitunixPosition:
     unrealized_pnl: float
     leverage: int
     margin: float
-    position_id: str = ""   # Bitunix positionId
+    position_id: str = ""   # positionIdx as string
+    stop_loss: float = 0.0  # exchange native SL price (from trading-stop)
+    take_profit: float = 0.0  # exchange native TP price (from trading-stop)
 
 
 class BotException(Exception):
