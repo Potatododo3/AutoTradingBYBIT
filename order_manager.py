@@ -106,6 +106,8 @@ class OrderManager:
         await self._reconcile_pending_entries()
         # Reconcile any trades that were closed externally while bot was offline
         await self._reconcile_closed_externally()
+        # Backfill exit prices for old closed trades that were saved with exit_price=0
+        await self._backfill_missing_exit_prices()
 
 
     def has_active_trade(self, pair: str) -> bool:
@@ -251,6 +253,48 @@ class OrderManager:
     #   PART_FILLED→ position partially exists, still place TPs on actual qty
     #   CANCELLED  → entry was cancelled externally, remove from DB
     #   NEW/live   → entry still pending, leave as-is (user can cancel or wait)
+
+
+    async def _backfill_missing_exit_prices(self) -> None:
+        """
+        One-time backfill: find closed trades with exit_price=0 and re-fetch
+        exit price from order history. Runs at startup after load_from_db.
+        """
+        trades = await self._db.get_trades_missing_exit()
+        if not trades:
+            return
+        logger.info(f"Backfill: {len(trades)} closed trade(s) missing exit price — fetching from history...")
+        patched = 0
+        for t in trades:
+            try:
+                start_ms = int(t.opened_at.timestamp() * 1000)
+                hist_orders = await self._client.get_history_orders(
+                    symbol=t.pair, limit=20, start_time=start_ms,
+                )
+                close_orders = [
+                    o for o in hist_orders
+                    if str(o.get("tradeSide", "")).upper() == "CLOSE"
+                    and str(o.get("status", "")).rstrip("_").upper() in ("FILLED", "PART_FILLED")
+                ]
+                if not close_orders:
+                    logger.debug(f"Backfill [{t.trade_id}] {t.pair}: no close orders found in history")
+                    continue
+                close_orders.sort(
+                    key=lambda o: int(o.get("ctime", o.get("mtime", 0)) or 0),
+                    reverse=True,
+                )
+                last = close_orders[0]
+                exit_price = float(last.get("price", 0) or 0)
+                fee        = float(last.get("fee", 0) or 0)
+                pnl        = float(last.get("realizedPNL", 0) or 0) - abs(fee)
+                if exit_price:
+                    await self._db.update_exit_price(t.trade_id, exit_price, pnl)
+                    logger.info(f"Backfill [{t.trade_id}] {t.pair}: exit={exit_price} pnl={pnl:.2f}")
+                    patched += 1
+            except Exception as e:
+                logger.warning(f"Backfill [{t.trade_id}] {t.pair}: failed — {e}")
+        if patched:
+            logger.info(f"Backfill complete: patched {patched}/{len(trades)} trade(s)")
 
     async def _reconcile_pending_entries(self) -> None:
         """

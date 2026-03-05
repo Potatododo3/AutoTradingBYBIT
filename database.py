@@ -376,6 +376,23 @@ class Database:
         rows = await cursor.fetchall()
         return [_row_to_trade(r) for r in rows]
 
+    async def get_trades_missing_exit(self) -> list[TradeRecord]:
+        """Return closed trades that are missing exit_price (exit_price=0)."""
+        cursor = await self._db.execute(
+            "SELECT * FROM trades WHERE status = 'closed' AND (exit_price IS NULL OR exit_price = 0)"
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_trade(r) for r in rows]
+
+    async def update_exit_price(self, trade_id: str, exit_price: float, realized_pnl: float) -> None:
+        """Patch exit_price and realized_pnl on a closed trade."""
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE trades SET exit_price = ?, realized_pnl = ? WHERE trade_id = ?",
+                (exit_price, realized_pnl, trade_id),
+            )
+            await self._db.commit()
+
     async def get_closed_trades(self, limit: int = 50) -> list[TradeRecord]:
         cursor = await self._db.execute(
             "SELECT * FROM trades WHERE status = 'closed' "
