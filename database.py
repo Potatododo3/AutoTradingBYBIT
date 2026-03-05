@@ -309,15 +309,6 @@ class Database:
             await self._db.commit()
             logger.debug(f"Updated trade {trade.trade_id}")
 
-    async def update_seen_close_ids(self, trade_id: str, seen_ids: str) -> None:
-        """Persist the seen_close_ids string for a trade (comma-separated order IDs)."""
-        async with self._lock:
-            await self._db.execute(
-                "UPDATE trades SET seen_close_ids = ? WHERE trade_id = ?",
-                (seen_ids, trade_id),
-            )
-            await self._db.commit()
-
     async def mark_closed(
         self,
         trade_id: str,
@@ -375,6 +366,15 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [_row_to_trade(r) for r in rows]
+
+    async def update_seen_close_ids(self, trade_id: str, seen_ids: str) -> None:
+        """Persist the seen_close_ids string for a trade (comma-separated order IDs)."""
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE trades SET seen_close_ids = ? WHERE trade_id = ?",
+                (seen_ids, trade_id),
+            )
+            await self._db.commit()
 
     async def get_trades_missing_exit(self) -> list[TradeRecord]:
         """Return closed trades that are missing exit_price (exit_price=0)."""
