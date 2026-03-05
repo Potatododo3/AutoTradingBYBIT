@@ -8,7 +8,7 @@ Every message reads like a real trading platform, not a chatbot.
 from datetime import datetime
 from typing import Optional
 
-from models import Side, TradeRecord, PositionSizing, TradeRequest, BitunixPosition
+from models import Side, TradeRecord, PositionSizing, TradeRequest, BybitPosition
 
 
 # ── Palette / tokens ──────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ def _fmt(v) -> str:
 def start(debug_mode: bool = False) -> str:
     mode = f"\n\n{WARN}  <b>DEBUG MODE</b> — orders simulated, no real trades placed." if debug_mode else ""
     return (
-        f"<b>BITUNIX FUTURES BOT</b>  {RKET}{mode}\n"
+        f"<b>BYBIT FUTURES BOT</b>  {RKET}{mode}\n"
         f"<code>{HDIV}</code>\n\n"
         f"  Your personal trading terminal.\n"
         f"  Manage risk, place trades, monitor stops\n"
@@ -317,7 +317,7 @@ def balance(available: float, equity: float) -> str:
     )
 
 
-def positions(pos_list: list[BitunixPosition], active_trades: dict, classified: dict | None = None) -> str:
+def positions(pos_list: list[BybitPosition], active_trades: dict, classified: dict | None = None) -> str:
     if not pos_list:
         return (
             f"<b>OPEN POSITIONS</b>\n"
@@ -377,15 +377,16 @@ def positions(pos_list: list[BitunixPosition], active_trades: dict, classified: 
         if lsl:
             sl_row = f"  <code>{'Limit SL':<12}</code>  ${_fmt(lsl['price'])}  ×{lsl['remaining']}\n"
 
-        # ── Native TPSL stop ─────────────────────────────────────────────────
-        # Source 1: trade.sl (bot DB record) — most accurate, includes BE tracking
-        # Source 2: classified["native_sl"] — injected from exchange TPSL endpoint
-        #           used when there is no bot trade record (synced / external position)
+
+        # ── Native exchange SL ────────────────────────────────────────────────
+        # Source 1: trade.sl (bot DB record, most accurate)
+        # Source 2: classified["native_sl"] — injected from position.stop_loss
+        #           (used when no bot trade record, e.g. synced positions)
         tpsl_row = ""
         sl_price_raw = None
         if trade and trade.sl and float(trade.sl) > 0:
             sl_price_raw = float(trade.sl)
-        elif not sl_price_raw:
+        if sl_price_raw is None:
             native = orders.get("native_sl", 0)
             if native and float(native) > 0:
                 sl_price_raw = float(native)
