@@ -275,14 +275,17 @@ class Journal:
             minutes = rem // 60
             duration = f"{hours}h {minutes}m"
 
+        exit_str = f"${trade.exit_price:,.4f}" if trade.exit_price else "N/A"
+        pnl_sign = "+" if trade.realized_pnl >= 0 else ""
         payload = self._embed(
             title="🔒 MANUAL CLOSE" if reason == "manual" else "🔒 TRADE CLOSED",
             color=DISCORD_COLOR_ORANGE,
             trade_id=trade.trade_id,
             fields=[
                 self._field("Pair", trade.pair),
-                self._field("Reason", reason),
-                self._field("Realized PnL", f"${trade.realized_pnl:.2f}"),
+                self._field("Entry", f"${trade.entry:,.4f}"),
+                self._field("Exit", exit_str),
+                self._field("Realized PnL", f"{pnl_sign}${trade.realized_pnl:.2f}"),
                 self._field("Duration", duration or "N/A"),
             ],
         )

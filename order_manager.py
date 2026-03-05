@@ -419,6 +419,28 @@ class OrderManager:
                 f"[{t.trade_id}] {t.pair} no longer on exchange — marking closed "
                 f"(likely closed via app, TP hit, or SL hit)"
             )
+            # Fetch exit price + PnL from order history (same as _reconcile_closed_externally)
+            try:
+                start_ms = int(t.opened_at.timestamp() * 1000)
+                hist_orders = await self._client.get_history_orders(
+                    symbol=t.pair, limit=10, start_time=start_ms,
+                )
+                close_orders = [
+                    o for o in hist_orders
+                    if str(o.get("tradeSide", "")).upper() == "CLOSE"
+                    and str(o.get("status", "")).rstrip("_").upper() in ("FILLED", "PART_FILLED")
+                ]
+                if close_orders:
+                    close_orders.sort(
+                        key=lambda o: int(o.get("ctime", o.get("mtime", 0)) or 0),
+                        reverse=True,
+                    )
+                    last = close_orders[0]
+                    t.exit_price   = float(last.get("price", 0) or 0)
+                    fee            = float(last.get("fee", 0) or 0)
+                    t.realized_pnl = float(last.get("realizedPNL", 0) or 0) - abs(fee)
+            except Exception as e:
+                logger.warning(f"[{t.trade_id}] Could not fetch close price for {t.pair}: {e}")
             t.status = TradeStatus.CLOSED
             t.closed_at = datetime.utcnow()
             await self._db.update_trade(t)

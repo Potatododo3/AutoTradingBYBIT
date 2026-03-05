@@ -437,7 +437,7 @@ def history(trades: list) -> str:
         side_str = _side_tag(t.side)
         lines.append(
             f"\n  <code>{t.trade_id}</code>  ·  <b>{t.pair}</b>  ·  {side_str}\n"
-            f"  <code>{'Entry → Exit':<14}</code>  ${_fmt(t.entry)} → ${_fmt(t.exit_price)}\n"
+            f"  <code>{'Entry → Exit':<14}</code>  ${_fmt(t.entry)} → {('$' + _fmt(t.exit_price)) if t.exit_price else 'N/A'}\n"
             f"  <code>{'PnL':<14}</code>  {pnl_str}\n"
             f"  <code>{'Closed':<14}</code>  <i>{_ts(t.closed_at)}</i>"
         )
