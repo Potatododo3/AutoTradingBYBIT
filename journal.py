@@ -1,3 +1,4 @@
+# Bybit Bot — journal.py
 import asyncio
 import csv
 import logging
@@ -110,9 +111,9 @@ class Journal:
                 self._field("Leverage", f"{trade.leverage}x"),
                 self._field("Margin Used", f"${sizing.margin_required:.2f}"),
                 self._field("Account Balance", f"${sizing.balance:.2f}"),
-                self._field("TP1", f"${trade.tp1:,.4f}"),
-                self._field("TP2", f"${trade.tp2:,.4f}"),
-                self._field("TP3", f"${trade.tp3:,.4f}"),
+                self._field("TP1", f"${trade.tp1:,.4f}" if trade.tp1 else "—"),
+                self._field("TP2", f"${trade.tp2:,.4f}" if trade.tp2 else "—"),
+                self._field("TP3", f"${trade.tp3:,.4f}" if trade.tp3 else "—"),
             ],
         )
         await self._fire_and_forget(payload)
