@@ -201,11 +201,13 @@ class OrderManager:
                     qty=tp3_qty, price=req.tp3, reduce_only=True, trade_side="CLOSE",
                     position_id=position_id,
                 )
-            if req.sl and req.sl > 0:
+            if req.sl and req.sl > 0 and not req.sl_timeframe:
+                # Hard SL — place on exchange only when no soft SL timeframe is set
                 tpsl_id = await self._client.place_tpsl(
                     symbol=pair, position_id=position_id, sl_price=req.sl,
                 )
             else:
+                # Soft SL (sl_timeframe set) or no SL — no exchange order
                 tpsl_id = ""
         else:
             tp3_order_id_val = ""
@@ -358,7 +360,8 @@ class OrderManager:
                             qty=tp3_qty, price=trade.tp3, reduce_only=True,
                             trade_side="CLOSE", position_id=position_id,
                         )
-                    if trade.sl and trade.sl > 0:
+                    if trade.sl and trade.sl > 0 and not trade.soft_sl_timeframe:
+                        # Only place hard SL if this is not a soft SL trade
                         trade.sl_order_id = await self._client.place_tpsl(
                             symbol=pair, position_id=position_id, sl_price=trade.sl,
                         )
