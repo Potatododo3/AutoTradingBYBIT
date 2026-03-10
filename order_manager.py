@@ -939,7 +939,8 @@ class OrderManager:
                         qty=tp3_qty, price=trade.tp3, reduce_only=True,
                         trade_side="CLOSE", position_id=position_id,
                     )
-                if trade.sl and trade.sl > 0:
+                if trade.sl and trade.sl > 0 and not trade.soft_sl_timeframe:
+                    # Only place hard SL if this is not a soft SL trade
                     trade.sl_order_id = await self._client.place_tpsl(
                         symbol=pair, position_id=position_id, sl_price=trade.sl,
                     )
