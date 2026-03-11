@@ -291,7 +291,9 @@ def trade_opened(trade: TradeRecord, debug_mode: bool = False) -> str:
         f"  <code>{'Entry':<12}</code>  ${_fmt(trade.entry)}\n"
         f"  <code>{'Size':<12}</code>  {trade.position_size}\n"
         f"  <code>{'Leverage':<12}</code>  {trade.leverage}×\n"
-        f"  <code>{'Soft SL':<12}</code>  ${_fmt(trade.sl)}\n"
+        + (f"  <code>{trade.soft_sl_timeframe + ' SL':<12}</code>  ${_fmt(trade.sl)}  <i>(candle monitor)</i>\n"
+           if trade.soft_sl_timeframe else
+           (f"  <code>{'Stop Loss':<12}</code>  ${_fmt(trade.sl)}\n" if trade.sl else ""))
         + _tp_opened_line(trade.tp1, trade.tp2, trade.tp3)
         + f"<code>{DIV}</code>\n"
         + f"  <i>Orders placed. Position is live.</i>"

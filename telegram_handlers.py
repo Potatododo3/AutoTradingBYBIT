@@ -1876,21 +1876,77 @@ class BotHandlers:
 
             dca_notional = dca_qty * dca_price
             side_tag     = "🟢 LONG" if trade.side == Side.LONG else "🔴 SHORT"
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅  CONFIRM & PLACE", callback_data=f"adddca:confirm:{pair}:{dca_price}:{dca_qty}:{new_sl}:{risk_amount:.2f}"),
-                InlineKeyboardButton("✖  Cancel",           callback_data="adddca:cancel"),
-            ]])
+
+            # Strategy multiplier qty (neil=2×, saltwayer=2.5×)
+            strategy   = trade.strategy or ""
+            mult       = 2.0 if strategy == "neil" else (2.5 if strategy == "saltwayer" else None)
+            mult_label = f"{mult}×" if mult else None
+
+            # Option A: lock qty to entry×mult, derive risk
+            mult_qty  = round(trade.position_size * mult, qp) if mult else None
+            mult_risk = round(mult_qty * stop_distance, 2) if mult_qty else None
+
+            # Option B: combined formula — back-calculate corrected entry qty
+            # so that entry_risk + dca_risk = target_risk exactly, with dca=M×entry
+            # entry_dist = |entry - new_sl|, dca_dist = |dca_price - new_sl|
+            # dca_qty_corrected = M × target_risk / (entry_dist + M × dca_dist)
+            corr_qty      = None
+            corr_risk     = None
+            corr_entry_qty = None
+            if mult and trade.entry:
+                is_long = trade.side == Side.LONG
+                entry_dist = (trade.entry - new_sl) if is_long else (new_sl - trade.entry)
+                dca_dist   = (dca_price - new_sl)   if is_long else (new_sl - dca_price)
+                denom = entry_dist + mult * dca_dist
+                if denom > 0:
+                    corr_entry_qty = risk_amount / denom
+                    corr_qty       = round(corr_entry_qty * mult, qp)
+                    corr_risk      = round(corr_qty * dca_dist, 2)
+                    corr_total     = round(corr_entry_qty * entry_dist + corr_qty * dca_dist, 2)
+
+            # Build keyboard
+            kb_rows = []
+            if mult_qty and mult_qty >= min_qty:
+                kb_rows.append([InlineKeyboardButton(
+                    f"📏  {mult_label}× entry size ({mult_qty} tokens)",
+                    callback_data=f"adddca:confirm:{pair}:{dca_price}:{mult_qty}:{new_sl}:{mult_risk:.2f}"
+                )])
+            if corr_qty and corr_qty >= min_qty:
+                kb_rows.append([InlineKeyboardButton(
+                    f"🎯  Exact {risk_amount:,.2f}$ total ({corr_qty} tokens)",
+                    callback_data=f"adddca:confirm:{pair}:{dca_price}:{corr_qty}:{new_sl}:{corr_risk:.2f}"
+                )])
+            kb_rows.append([InlineKeyboardButton(
+                f"📐  Risk-sized ({dca_qty} tokens)",
+                callback_data=f"adddca:confirm:{pair}:{dca_price}:{dca_qty}:{new_sl}:{risk_amount:.2f}"
+            )])
+            kb_rows.append([InlineKeyboardButton("✖  Cancel", callback_data="adddca:cancel")])
+            kb = InlineKeyboardMarkup(kb_rows)
+
+            strategy_line = ""
+            if mult and trade.entry:
+                if mult_qty and mult_qty >= min_qty:
+                    strategy_line += (
+                        f"  <code>{'Mult sized':<11}</code>  {mult_label} entry = {mult_qty} tokens  →  risk ${mult_risk:,.2f}\n"
+                    )
+                if corr_qty and corr_qty >= min_qty:
+                    strategy_line += (
+                        f"  <code>{'Exact 5%':<11}</code>  corrected = {corr_qty} tokens  →  DCA risk ${corr_risk:,.2f}  (total ${corr_total:,.2f})\n"
+                    )
+
             await msg.edit_text(
                 f"<b>DCA SUMMARY — {pair}</b>\n"
                 f"<code>{sep}</code>\n\n"
                 f"  {side_tag}\n\n"
+                f"  <code>Entry      </code>  {trade.position_size} tokens @ ${_fmt(trade.entry)}\n"
                 f"  <code>DCA Price  </code>  ${_fmt(dca_price)}\n"
-                f"  <code>Qty        </code>  {dca_qty} tokens\n"
-                f"  <code>Notional   </code>  ${dca_notional:,.2f}\n"
-                f"  <code>Risk       </code>  ${risk_amount:,.2f}\n"
                 f"  <code>New SL     </code>  ${_fmt(new_sl)}\n"
-                f"  <code>Old SL     </code>  ${_fmt(trade.sl)}\n\n"
-                f"  <i>Confirm to place DCA order and move SL.</i>",
+                f"  <code>Old SL     </code>  ${_fmt(trade.sl)}\n"
+                f"  <code>Risk input </code>  ${risk_amount:,.2f}\n"
+                f"<code>{'─'*28}</code>\n"
+                f"{strategy_line}"
+                f"  <code>{'Risk-sized':<11}</code>  {dca_qty} tokens  →  risk ${risk_amount:,.2f}\n\n"
+                f"  <i>🎯 Exact uses combined formula so entry+DCA = ${risk_amount:,.2f} exactly at new SL.</i>",
                 parse_mode="HTML",
                 reply_markup=kb,
             )
