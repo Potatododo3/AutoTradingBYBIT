@@ -392,7 +392,8 @@ def positions(pos_list: list[BybitPosition], active_trades: dict, classified: di
             native = orders.get("native_sl", 0)
             if native and float(native) > 0:
                 sl_price_raw = float(native)
-        if sl_price_raw:
+        is_soft = bool(trade and trade.soft_sl_timeframe)
+        if sl_price_raw and not is_soft:
             is_be = abs(sl_price_raw - p.entry_price) < (p.entry_price * 0.0001)
             sl_label = "SL Breakeven" if is_be else "Stop Loss"
             tpsl_row = f"  <code>{sl_label:<12}</code>  ${_fmt(sl_price_raw)}\n"

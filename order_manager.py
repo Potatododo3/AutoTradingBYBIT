@@ -1380,15 +1380,13 @@ class OrderManager:
         live_qty   = position.size
         close_side = "SELL" if trade.side == Side.LONG else "BUY"
 
-        # Cancel existing TP orders
+        # Cancel ALL open orders for the pair (catches ghost orders not tracked in DB)
+        try:
+            await self._client.cancel_all_orders(pair)
+        except APIError as e:
+            logger.warning(f"rebalance_tps: cancel_all_orders {pair} failed: {e}")
         for attr in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
-            oid = getattr(trade, attr, "")
-            if oid:
-                try:
-                    await self._client.cancel_order(pair, oid)
-                except APIError:
-                    pass
-                setattr(trade, attr, "")
+            setattr(trade, attr, "")
 
         # Re-place with corrected proportions
         tp1_qty, tp2_qty, tp3_qty = _safe_tp_qtys(live_qty, s.tp1_pct, s.tp2_pct, qp, min_qty)
