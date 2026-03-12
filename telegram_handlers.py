@@ -192,6 +192,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("setleverage", self.cmd_setleverage))
         app.add_handler(CommandHandler("tp",          self.cmd_tp))
         app.add_handler(CommandHandler("dca",         self.cmd_dca))
+        app.add_handler(CommandHandler("fixtp",       self.cmd_fixtp))
         app.add_handler(CallbackQueryHandler(self._handle_addtp,  pattern="^addtp:"))
         app.add_handler(CallbackQueryHandler(self._handle_adddca, pattern="^adddca:"))
         app.add_handler(CallbackQueryHandler(self.handle_callback,  pattern="^closeall:"))
@@ -1956,6 +1957,61 @@ class BotHandlers:
         except Exception as e:
             logger.error(f"cmd_dca sizing error: {e}", exc_info=True)
             await msg.edit_text(f"<b>ERROR</b>  <code>{e}</code>", parse_mode="HTML")
+
+
+    @auth_required
+    async def cmd_fixtp(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /fixtp PAIR
+        Cancel existing TP orders and re-place them proportionally
+        based on live position size from exchange.
+        """
+        sep  = "─" * 28
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                f"<b>FIX TP PROPORTIONS</b>\n"
+                f"<code>{sep}</code>\n\n"
+                f"  <code>/fixtp PAIR</code>\n\n"
+                f"  Cancels existing TP orders and re-places them\n"
+                f"  correctly sized against the live position on exchange.",
+                parse_mode="HTML",
+            )
+            return
+
+        pair  = args[0].upper()
+        trade = self._om.get_active_trade(pair)
+        if not trade:
+            await update.message.reply_text(
+                f"<b>NOT FOUND</b>  No active trade for <b>{pair}</b>.\n\n"
+                f"  Use /sync to import it first.",
+                parse_mode="HTML",
+            )
+            return
+
+        msg = await update.message.reply_text(f"⏳ Rebalancing TPs for {pair}...")
+        try:
+            result = await self._om.rebalance_tps(pair)
+            s      = get_settings()
+            tp1_p  = int(s.tp1_pct * 100)
+            tp2_p  = int(s.tp2_pct * 100)
+            tp3_p  = 100 - tp1_p - tp2_p
+            await msg.edit_text(
+                f"<b>TP REBALANCED</b>  ✅\n"
+                f"<code>{sep}</code>\n\n"
+                f"  <b>{pair}</b>\n\n"
+                f"  <code>Live qty   </code>  {result['total_qty']}\n"
+                f"  <code>TP1 ({tp1_p}%)  </code>  {result['tp1_qty']} tokens  @  ${_fmt(trade.tp1)}\n"
+                + (f"  <code>TP2 ({tp2_p}%)  </code>  {result['tp2_qty']} tokens  @  ${_fmt(trade.tp2)}\n" if result['tp2_qty'] else "")
+                + (f"  <code>TP3 ({tp3_p}%)  </code>  {result['tp3_qty']} tokens  @  ${_fmt(trade.tp3)}\n" if result['tp3_qty'] else "")
+                + f"\n  <i>TP orders re-placed on exchange.</i>",
+                parse_mode="HTML",
+            )
+        except (ValueError, APIError) as e:
+            await msg.edit_text(
+                f"<b>FIXTP FAILED</b>\n\n<code>{e}</code>",
+                parse_mode="HTML",
+            )
 
     @auth_required
     async def _handle_adddca(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

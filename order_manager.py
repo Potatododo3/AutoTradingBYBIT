@@ -896,9 +896,9 @@ class OrderManager:
         # Also check DCA fills for trades that already have a position
         dca_pending = [t for t in self._cache.values()
                        if t.position_id and t.dca_order_id]
-        if not pending:
+        if not pending and not dca_pending:
             return
-        logger.debug(f"Entry fill poller: {len(pending)} pending entrie(s)")
+        logger.debug(f"Entry fill poller: {len(pending)} pending entrie(s), {len(dca_pending)} DCA pending")
         for trade in pending:
             pair = trade.pair
             try:
@@ -1356,6 +1356,69 @@ class OrderManager:
         return order_id
 
     # ── /dca — add DCA order with independent risk sizing ────────────────────
+
+    async def rebalance_tps(self, pair: str) -> dict:
+        """
+        Cancel all existing TP orders for a trade and re-place them
+        proportionally based on the live position size from the exchange.
+        Returns a dict with keys: tp1_qty, tp2_qty, tp3_qty, total_qty.
+        Raises ValueError if no active trade or no position found.
+        """
+        trade = self.get_active_trade(pair)
+        if not trade:
+            raise ValueError(f"No active trade for {pair}")
+
+        s           = get_settings()
+        sym_info    = await self._client.get_symbol_info(pair)
+        qp          = sym_info["basePrecision"]
+        min_qty     = sym_info["minTradeVolume"]
+
+        # Fetch live position size from exchange
+        position = await self._client.get_position(pair)
+        if not position:
+            raise ValueError(f"No live position found for {pair} on exchange")
+        live_qty   = position.size
+        close_side = "SELL" if trade.side == Side.LONG else "BUY"
+
+        # Cancel existing TP orders
+        for attr in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
+            oid = getattr(trade, attr, "")
+            if oid:
+                try:
+                    await self._client.cancel_order(pair, oid)
+                except APIError:
+                    pass
+                setattr(trade, attr, "")
+
+        # Re-place with corrected proportions
+        tp1_qty, tp2_qty, tp3_qty = _safe_tp_qtys(live_qty, s.tp1_pct, s.tp2_pct, qp, min_qty)
+
+        if trade.tp1 and trade.tp1 > 0:
+            trade.tp1_order_id = await self._client.place_order(
+                symbol=pair, side=close_side, order_type="LIMIT",
+                qty=tp1_qty, price=trade.tp1, reduce_only=True,
+                trade_side="CLOSE", position_id=trade.position_id,
+            )
+        if tp2_qty > 0 and trade.tp2 and trade.tp2 > 0:
+            trade.tp2_order_id = await self._client.place_order(
+                symbol=pair, side=close_side, order_type="LIMIT",
+                qty=tp2_qty, price=trade.tp2, reduce_only=True,
+                trade_side="CLOSE", position_id=trade.position_id,
+            )
+        if tp3_qty > 0 and trade.tp3 and trade.tp3 > 0:
+            trade.tp3_order_id = await self._client.place_order(
+                symbol=pair, side=close_side, order_type="LIMIT",
+                qty=tp3_qty, price=trade.tp3, reduce_only=True,
+                trade_side="CLOSE", position_id=trade.position_id,
+            )
+
+        trade.position_size = live_qty
+        await self._db.update_trade(trade)
+        logger.info(
+            f"[{trade.trade_id}] rebalance_tps {pair}: live_qty={live_qty} "
+            f"tp1={tp1_qty} tp2={tp2_qty} tp3={tp3_qty}"
+        )
+        return {"tp1_qty": tp1_qty, "tp2_qty": tp2_qty, "tp3_qty": tp3_qty, "total_qty": live_qty}
 
     async def add_dca_order(
         self,
