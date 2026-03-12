@@ -99,6 +99,8 @@ class OrderManager:
         await self._reconcile_pending_entries()
         # Reconcile any trades that were closed externally while bot was offline
         await self._reconcile_closed_externally()
+        # Backfill exit prices for old closed trades that were saved with exit_price=0
+        await self._backfill_missing_exit_prices()
 
 
     def has_active_trade(self, pair: str) -> bool:
@@ -192,11 +194,13 @@ class OrderManager:
                     qty=tp3_qty, price=req.tp3, reduce_only=True, trade_side="CLOSE",
                     position_id=position_id,
                 )
-            if req.sl and req.sl > 0:
+            if req.sl and req.sl > 0 and not req.sl_timeframe:
+                # Hard SL — place on exchange only when no soft SL timeframe is set
                 tpsl_id = await self._client.place_tpsl(
                     symbol=pair, position_id=position_id, sl_price=req.sl,
                 )
             else:
+                # Soft SL (sl_timeframe set) or no SL — no exchange order
                 tpsl_id = ""
         else:
             tp3_order_id_val = ""
@@ -244,6 +248,48 @@ class OrderManager:
     #   PART_FILLED→ position partially exists, still place TPs on actual qty
     #   CANCELLED  → entry was cancelled externally, remove from DB
     #   NEW/live   → entry still pending, leave as-is (user can cancel or wait)
+
+
+    async def _backfill_missing_exit_prices(self) -> None:
+        """
+        One-time backfill: find closed trades with exit_price=0 and re-fetch
+        exit price from order history. Runs at startup after load_from_db.
+        """
+        trades = await self._db.get_trades_missing_exit()
+        if not trades:
+            return
+        logger.info(f"Backfill: {len(trades)} closed trade(s) missing exit price — fetching from history...")
+        patched = 0
+        for t in trades:
+            try:
+                start_ms = int(t.opened_at.timestamp() * 1000)
+                hist_orders = await self._client.get_history_orders(
+                    symbol=t.pair, limit=20, start_time=start_ms,
+                )
+                close_orders = [
+                    o for o in hist_orders
+                    if str(o.get("tradeSide", "")).upper() == "CLOSE"
+                    and str(o.get("status", "")).rstrip("_").upper() in ("FILLED", "PART_FILLED")
+                ]
+                if not close_orders:
+                    logger.debug(f"Backfill [{t.trade_id}] {t.pair}: no close orders found in history")
+                    continue
+                close_orders.sort(
+                    key=lambda o: int(o.get("ctime", o.get("mtime", 0)) or 0),
+                    reverse=True,
+                )
+                last = close_orders[0]
+                exit_price = float(last.get("price", 0) or 0)
+                fee        = float(last.get("fee", 0) or 0)
+                pnl        = float(last.get("realizedPNL", 0) or 0) - abs(fee)
+                if exit_price:
+                    await self._db.update_exit_price(t.trade_id, exit_price, pnl)
+                    logger.info(f"Backfill [{t.trade_id}] {t.pair}: exit={exit_price} pnl={pnl:.2f}")
+                    patched += 1
+            except Exception as e:
+                logger.warning(f"Backfill [{t.trade_id}] {t.pair}: failed — {e}")
+        if patched:
+            logger.info(f"Backfill complete: patched {patched}/{len(trades)} trade(s)")
 
     async def _reconcile_pending_entries(self) -> None:
         """
@@ -307,7 +353,8 @@ class OrderManager:
                             qty=tp3_qty, price=trade.tp3, reduce_only=True,
                             trade_side="CLOSE", position_id=position_id,
                         )
-                    if trade.sl and trade.sl > 0:
+                    if trade.sl and trade.sl > 0 and not trade.soft_sl_timeframe:
+                        # Only place hard SL if this is not a soft SL trade
                         trade.sl_order_id = await self._client.place_tpsl(
                             symbol=pair, position_id=position_id, sl_price=trade.sl,
                         )
@@ -412,6 +459,28 @@ class OrderManager:
                 f"[{t.trade_id}] {t.pair} no longer on exchange — marking closed "
                 f"(likely closed via app, TP hit, or SL hit)"
             )
+            # Fetch exit price + PnL from order history
+            try:
+                start_ms = int(t.opened_at.timestamp() * 1000)
+                hist_orders = await self._client.get_history_orders(
+                    symbol=t.pair, limit=10, start_time=start_ms,
+                )
+                close_orders = [
+                    o for o in hist_orders
+                    if str(o.get("tradeSide", "")).upper() == "CLOSE"
+                    and str(o.get("status", "")).rstrip("_").upper() in ("FILLED", "PART_FILLED")
+                ]
+                if close_orders:
+                    close_orders.sort(
+                        key=lambda o: int(o.get("ctime", o.get("mtime", 0)) or 0),
+                        reverse=True,
+                    )
+                    last = close_orders[0]
+                    t.exit_price   = float(last.get("price", 0) or 0)
+                    fee            = float(last.get("fee", 0) or 0)
+                    t.realized_pnl = float(last.get("realizedPNL", 0) or 0) - abs(fee)
+            except Exception as e:
+                logger.warning(f"[{t.trade_id}] Could not fetch close price for {t.pair}: {e}")
             t.status = TradeStatus.CLOSED
             t.closed_at = datetime.utcnow()
             await self._db.update_trade(t)
@@ -746,9 +815,19 @@ class OrderManager:
         old_sl = trade.sl
 
         if trade.position_id:
-            await self._client.modify_position_tpsl(
-                symbol=pair, position_id=trade.position_id, sl_price=new_sl,
-            )
+            if trade.sl_order_id:
+                # Existing TPSL order — modify it in place
+                await self._client.modify_position_tpsl(
+                    symbol=pair, position_id=trade.position_id, sl_price=new_sl,
+                )
+            else:
+                # No TPSL order yet (trade opened without SL, or SL was never placed)
+                # Must create a new TPSL order instead of modifying
+                new_tpsl_id = await self._client.place_tpsl(
+                    symbol=pair, position_id=trade.position_id, sl_price=new_sl,
+                )
+                trade.sl_order_id = new_tpsl_id
+                logger.info(f"[{trade.trade_id}] No existing TPSL — placed new SL order {new_tpsl_id} for {pair}")
         else:
             # Fallback: cancel old SL limit, place new one
             if trade.sl_order_id:
@@ -820,9 +899,9 @@ class OrderManager:
         # Also check DCA fills for trades that already have a position
         dca_pending = [t for t in self._cache.values()
                        if t.position_id and t.dca_order_id]
-        if not pending:
+        if not pending and not dca_pending:
             return
-        logger.debug(f"Entry fill poller: {len(pending)} pending entrie(s)")
+        logger.debug(f"Entry fill poller: {len(pending)} pending entrie(s), {len(dca_pending)} DCA pending")
         for trade in pending:
             pair = trade.pair
             try:
@@ -863,7 +942,8 @@ class OrderManager:
                         qty=tp3_qty, price=trade.tp3, reduce_only=True,
                         trade_side="CLOSE", position_id=position_id,
                     )
-                if trade.sl and trade.sl > 0:
+                if trade.sl and trade.sl > 0 and not trade.soft_sl_timeframe:
+                    # Only place hard SL if this is not a soft SL trade
                     trade.sl_order_id = await self._client.place_tpsl(
                         symbol=pair, position_id=position_id, sl_price=trade.sl,
                     )
@@ -1211,6 +1291,139 @@ class OrderManager:
                 logger.warning(f"[{trade.trade_id}] {pair} close poll APIError: {e}")
             except Exception as e:
                 logger.error(f"[{trade.trade_id}] {pair} close poll error: {e}", exc_info=True)
+
+
+    async def add_tp_order(self, pair: str, price: float, qty: float, slot: int) -> str:
+        """
+        Place a take-profit order for an existing tracked trade and record it.
+        price=0 means market (reduceOnly market order).
+        slot: 1, 2, or 3 — which tp slot to assign the order to.
+        Returns order_id.
+        """
+        trade = self._cache.get(pair)
+        if not trade:
+            raise ValueError(f"No active trade for {pair}")
+
+        from models import Side
+        side = "SELL" if trade.side == Side.LONG else "BUY"
+        order_type = "MARKET" if price == 0.0 else "LIMIT"
+
+        order_id = await self._client.place_order(
+            symbol=pair,
+            side=side,
+            order_type=order_type,
+            qty=qty,
+            price=price if order_type == "LIMIT" else None,
+            reduce_only=True,
+        )
+
+        # Store in trade record
+        if slot == 1:
+            trade.tp1          = price
+            trade.tp1_order_id = order_id
+        elif slot == 2:
+            trade.tp2          = price
+            trade.tp2_order_id = order_id
+        elif slot == 3:
+            trade.tp3          = price
+            trade.tp3_order_id = order_id
+
+        await self._db.update_trade(trade)
+        logger.info(f"[{trade.trade_id}] add_tp_order TP{slot} {pair} @ {price} qty={qty} id={order_id}")
+        return order_id
+
+    async def rebalance_tps(self, pair: str) -> dict:
+        """
+        Cancel all existing TP orders for a trade and re-place them
+        proportionally based on the live position size from the exchange.
+        Returns a dict with keys: tp1_qty, tp2_qty, tp3_qty, total_qty.
+        Raises ValueError if no active trade or no position found.
+        """
+        trade = self.get_active_trade(pair)
+        if not trade:
+            raise ValueError(f"No active trade for {pair}")
+
+        s           = get_settings()
+        sym_info    = await self._client.get_symbol_info(pair)
+        qp          = sym_info["basePrecision"]
+        min_qty     = sym_info["minTradeVolume"]
+
+        # Fetch live position size from exchange
+        position = await self._client.get_position(pair)
+        if not position:
+            raise ValueError(f"No live position found for {pair} on exchange")
+        live_qty   = position.size
+        close_side = "SELL" if trade.side == Side.LONG else "BUY"
+
+        # Cancel ALL open orders for the pair (catches ghost orders not tracked in DB)
+        try:
+            await self._client.cancel_all_orders(pair)
+        except APIError as e:
+            logger.warning(f"rebalance_tps: cancel_all_orders {pair} failed: {e}")
+        for attr in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
+            setattr(trade, attr, "")
+
+        # Re-place with corrected proportions
+        tp1_qty, tp2_qty, tp3_qty = _safe_tp_qtys(live_qty, s.tp1_pct, s.tp2_pct, qp, min_qty)
+
+        if trade.tp1 and trade.tp1 > 0:
+            trade.tp1_order_id = await self._client.place_order(
+                symbol=pair, side=close_side, order_type="LIMIT",
+                qty=tp1_qty, price=trade.tp1, reduce_only=True,
+                trade_side="CLOSE", position_id=trade.position_id,
+            )
+        if tp2_qty > 0 and trade.tp2 and trade.tp2 > 0:
+            trade.tp2_order_id = await self._client.place_order(
+                symbol=pair, side=close_side, order_type="LIMIT",
+                qty=tp2_qty, price=trade.tp2, reduce_only=True,
+                trade_side="CLOSE", position_id=trade.position_id,
+            )
+        if tp3_qty > 0 and trade.tp3 and trade.tp3 > 0:
+            trade.tp3_order_id = await self._client.place_order(
+                symbol=pair, side=close_side, order_type="LIMIT",
+                qty=tp3_qty, price=trade.tp3, reduce_only=True,
+                trade_side="CLOSE", position_id=trade.position_id,
+            )
+
+        trade.position_size = live_qty
+        await self._db.update_trade(trade)
+        logger.info(
+            f"[{trade.trade_id}] rebalance_tps {pair}: live_qty={live_qty} "
+            f"tp1={tp1_qty} tp2={tp2_qty} tp3={tp3_qty}"
+        )
+        return {"tp1_qty": tp1_qty, "tp2_qty": tp2_qty, "tp3_qty": tp3_qty, "total_qty": live_qty}
+
+    async def add_dca_order(self, pair: str, dca_price: float, dca_qty: float, new_sl: float) -> str:
+        """
+        Place a DCA limit entry order for an existing tracked trade.
+        Also moves the exchange SL to new_sl.
+        Returns order_id.
+        """
+        trade = self._cache.get(pair)
+        if not trade:
+            raise ValueError(f"No active trade for {pair}")
+
+        from models import Side
+        side = "BUY" if trade.side == Side.LONG else "SELL"
+
+        order_id = await self._client.place_order(
+            symbol=pair,
+            side=side,
+            order_type="LIMIT",
+            qty=dca_qty,
+            price=dca_price,
+            reduce_only=False,
+        )
+
+        # Move exchange SL to new_sl
+        await self.modify_sl(pair, new_sl)
+
+        # Update trade record
+        trade.dca          = dca_price
+        trade.dca_order_id = order_id
+        await self._db.update_trade(trade)
+        logger.info(f"[{trade.trade_id}] add_dca_order {pair} @ {dca_price} qty={dca_qty} new_sl={new_sl} id={order_id}")
+        return order_id
 
 
 
