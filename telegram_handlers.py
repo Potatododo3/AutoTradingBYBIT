@@ -12,7 +12,7 @@ from telegram.warnings import PTBUserWarning
 
 import messages as M
 from messages import _fmt  # price formatter — no trailing zeros, no sci notation
-from bybit_client import BybitClient
+from bitunix_client import BitunixClient
 from config import AUTHORIZED_USER_ID, DEBUG_MODE
 from database import Database
 from journal import Journal
@@ -58,6 +58,14 @@ def auth_required(func):
 
 # ── Shared UI helpers ─────────────────────────────────────────────────────────
 
+
+def _risk_step_kb(default_pct: float) -> InlineKeyboardMarkup:
+    """Keyboard for the risk step — quick-tap default + abort."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⚡  Use default ({default_pct:.1f}%)", callback_data="risk:use_default")],
+        [InlineKeyboardButton("✖  Abort trade", callback_data="wizard:cancel")],
+    ])
+
 def _abort_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✖  Abort trade", callback_data="wizard:cancel")
@@ -85,7 +93,7 @@ def _trail(d: dict) -> str:
 class BotHandlers:
     def __init__(
         self,
-        client: BybitClient,
+        client: BitunixClient,
         order_manager: OrderManager,
         risk_manager: RiskManager,
         journal: Journal,
@@ -131,6 +139,7 @@ class BotHandlers:
                 ],
                 ASK_RISK:  [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.trade_risk),
+                    CallbackQueryHandler(self.trade_risk_default, pattern="^risk:use_default$"),
                     CallbackQueryHandler(self._wiz_cancel,  pattern="^wizard:cancel$"),
                 ],
                 ASK_SL:    [
@@ -190,11 +199,6 @@ class BotHandlers:
         app.add_handler(CommandHandler("setsl",      self.cmd_setsl))
         app.add_handler(CommandHandler("setstrategy", self.cmd_setstrategy))
         app.add_handler(CommandHandler("setleverage", self.cmd_setleverage))
-        app.add_handler(CommandHandler("tp",          self.cmd_tp))
-        app.add_handler(CommandHandler("dca",         self.cmd_dca))
-        app.add_handler(CommandHandler("fixtp",       self.cmd_fixtp))
-        app.add_handler(CallbackQueryHandler(self._handle_addtp,  pattern="^addtp:"))
-        app.add_handler(CallbackQueryHandler(self._handle_adddca, pattern="^adddca:"))
         app.add_handler(CallbackQueryHandler(self.handle_callback,  pattern="^closeall:"))
         app.add_handler(CallbackQueryHandler(self._soft_sl_action,  pattern="^softsl:"))
 
@@ -379,7 +383,7 @@ class BotHandlers:
             f"  <code>50$</code>  — fixed $50\n\n"
             f"  <i>Default: {s.default_risk_pct:.1f}% of "
             f"{'$'+f'{s.risk_balance:,.2f}' if s.risk_balance > 0 else 'live equity'}</i>",
-            parse_mode="HTML", reply_markup=_abort_kb(),
+            parse_mode="HTML", reply_markup=_risk_step_kb(s.default_risk_pct),
         )
         return ASK_RISK
 
@@ -416,9 +420,30 @@ class BotHandlers:
             f"  <code>50$</code>  — fixed $50\n\n"
             f"  <i>Default: {s.default_risk_pct:.1f}% of "
             f"{'$'+f'{s.risk_balance:,.2f}' if s.risk_balance > 0 else 'live equity'}</i>",
-            parse_mode="HTML", reply_markup=_abort_kb(),
+            parse_mode="HTML", reply_markup=_risk_step_kb(s.default_risk_pct),
         )
         return ASK_RISK
+
+
+    @auth_required
+    async def trade_risk_default(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """User tapped 'Use default (X%)' in risk step — inject default_risk_pct."""
+        await update.callback_query.answer()
+        s = get_settings()
+        d = context.user_data[TRADE_KEY]
+        d["risk_value"] = s.default_risk_pct
+        d["risk_type"]  = "percent"
+        side = d["side"]
+        sl_hint = "below entry" if side == "long" else "above entry"
+        await update.callback_query.edit_message_text(
+            f"<b>NEW TRADE</b>  /  Step 6 of 9\n"
+            f"<code>{'═'*28}</code>\n\n"
+            f"  Risk set to <b>{s.default_risk_pct:.1f}%</b>\n\n"
+            f"  <b>STOP LOSS</b>\n\n"
+            f"  Enter your SL price ({sl_hint}):",
+            parse_mode="HTML", reply_markup=_abort_kb(),
+        )
+        return ASK_SL
 
     @auth_required
     async def trade_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -790,6 +815,22 @@ class BotHandlers:
         d["_req"]    = req
         d["_sizing"] = sizing
 
+        # Skip confirm step if confirmation_required is OFF
+        if not s.confirmation_required:
+            trade = await self._om.open_trade(req, sizing)
+            if req.sl_timeframe:
+                try:
+                    await self._om.set_soft_sl(req.pair, req.sl, req.sl_timeframe)
+                except Exception as e:
+                    logger.warning(f"Could not set soft SL after open: {e}")
+            txt = M.trade_opened(trade, DEBUG_MODE)
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(txt, parse_mode="HTML")
+            else:
+                await sent.edit_text(txt, parse_mode="HTML")
+            context.user_data.pop(TRADE_KEY, None)
+            return ConversationHandler.END
+
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅  CONFIRM & PLACE", callback_data="trade:confirm"),
             InlineKeyboardButton("✖  Cancel",          callback_data="trade:cancel"),
@@ -931,18 +972,13 @@ class BotHandlers:
         try:
             pos_list      = await self._client.get_positions()
             active_trades = await self._db.get_active_trades()
-            # Classify live pending orders per position for accurate TP/DCA/SL display.
-            # On Bybit, SL lives in position data (stop_loss field), not a separate order.
+            # Classify live pending orders per position for accurate TP/DCA/SL display
             classified: dict[str, dict] = {}
             for pos in pos_list:
                 is_long = pos.side.upper() == "LONG"
-                result = await self._om.classify_orders(
+                classified[pos.symbol] = await self._om.classify_orders(
                     pos.symbol, pos.entry_price, is_long
                 )
-                # Inject native SL so messages.py can show it even without a bot trade record
-                if pos.stop_loss and pos.stop_loss > 0:
-                    result["native_sl"] = pos.stop_loss
-                classified[pos.symbol] = result
             await msg.edit_text(
                 M.positions(pos_list, active_trades, classified),
                 parse_mode="HTML"
@@ -1600,468 +1636,12 @@ class BotHandlers:
             logger.error(f"cmd_setleverage: {e}", exc_info=True)
             await msg.edit_text(f"<b>ERROR</b>  <code>{e}</code>", parse_mode="HTML")
 
-
-    # ── /tp — add a TP order to a tracked trade ───────────────────────────────
-
-    @auth_required
-    async def cmd_tp(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """
-        Add a take-profit limit order to a tracked trade.
-        Usage:
-          /tp PAIR PRICE QTY   — limit TP at PRICE for QTY tokens
-          /tp PAIR cmp QTY     — market close QTY tokens now
-        """
-        sep  = "─" * 28
-        args = context.args or []
-
-        if len(args) < 2:
-            await update.message.reply_text(
-                f"<b>ADD TAKE PROFIT</b>\n"
-                f"<code>{sep}</code>\n\n"
-                f"  <code>/tp PAIR PRICE QTY</code>   — limit TP\n"
-                f"  <code>/tp PAIR cmp QTY</code>     — market close now\n\n"
-                f"  <b>QTY</b> is the number of tokens to close at this TP.",
-                parse_mode="HTML",
-            )
-            return
-
-        pair = args[0].upper()
-        trade = self._om.get_active_trade(pair)
-        if not trade:
-            await update.message.reply_text(
-                f"<b>NOT FOUND</b>  No active trade for <b>{pair}</b>.\n\n"
-                f"  Use /sync to import it first.",
-                parse_mode="HTML",
-            )
-            return
-
-        price_raw = args[1].lower()
-        is_market = price_raw in ("cmp", "market", "0")
-        if is_market:
-            price = 0.0
-        else:
-            try:
-                price = float(price_raw)
-                if price <= 0:
-                    raise ValueError
-            except ValueError:
-                await update.message.reply_text(
-                    "<b>INVALID PRICE</b>  Use a number or <code>cmp</code> for market.",
-                    parse_mode="HTML",
-                )
-                return
-
-        if not is_market and trade.entry > 0:
-            if trade.side == Side.LONG and price <= trade.entry:
-                await update.message.reply_text(
-                    f"<b>INVALID TP</b>  ${_fmt(price)} must be <b>above</b> entry "
-                    f"${_fmt(trade.entry)} for a LONG.",
-                    parse_mode="HTML",
-                )
-                return
-            if trade.side == Side.SHORT and price >= trade.entry:
-                await update.message.reply_text(
-                    f"<b>INVALID TP</b>  ${_fmt(price)} must be <b>below</b> entry "
-                    f"${_fmt(trade.entry)} for a SHORT.",
-                    parse_mode="HTML",
-                )
-                return
-
-        if len(args) >= 3:
-            try:
-                qty = float(args[2])
-                if qty <= 0:
-                    raise ValueError
-            except ValueError:
-                await update.message.reply_text(
-                    "<b>INVALID QTY</b>  Enter a positive number of tokens.",
-                    parse_mode="HTML",
-                )
-                return
-        else:
-            await update.message.reply_text(
-                f"<b>ADD TP — {pair}</b>\n"
-                f"<code>{sep}</code>\n\n"
-                f"  <code>Position size </code>  {trade.position_size} tokens\n"
-                f"  <code>TP1 order     </code>  {'✅ set' if trade.tp1_order_id else '—'}\n"
-                f"  <code>TP2 order     </code>  {'✅ set' if trade.tp2_order_id else '—'}\n"
-                f"  <code>TP3 order     </code>  {'✅ set' if trade.tp3_order_id else '—'}\n\n"
-                f"  Re-send with qty:\n"
-                f"  <code>/tp {pair} {price_raw} QTY</code>",
-                parse_mode="HTML",
-            )
-            return
-
-        price_label = "CMP (market)" if is_market else f"${_fmt(price)}"
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("TP1", callback_data=f"addtp:{pair}:{price}:{qty}:1"),
-                InlineKeyboardButton("TP2", callback_data=f"addtp:{pair}:{price}:{qty}:2"),
-                InlineKeyboardButton("TP3", callback_data=f"addtp:{pair}:{price}:{qty}:3"),
-            ],
-            [InlineKeyboardButton("✖  Cancel", callback_data="addtp:cancel")],
-        ])
-        await update.message.reply_text(
-            f"<b>ADD TAKE PROFIT — {pair}</b>\n"
-            f"<code>{sep}</code>\n\n"
-            f"  <code>Price  </code>  {price_label}\n"
-            f"  <code>Qty    </code>  {qty} tokens\n\n"
-            f"  Which TP slot?",
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
-
-    @auth_required
-    async def _handle_addtp(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        data = query.data
-
-        if data == "addtp:cancel":
-            await query.edit_message_text("<b>TP ORDER CANCELLED</b>", parse_mode="HTML")
-            return
-
-        try:
-            _, pair, price_s, qty_s, slot_s = data.split(":")
-            price = float(price_s)
-            qty   = float(qty_s)
-            slot  = int(slot_s)
-        except Exception:
-            await query.edit_message_text("<b>ERROR</b>  Malformed callback data.", parse_mode="HTML")
-            return
-
-        sep = "─" * 28
-        await query.edit_message_text(f"⏳ Placing TP{slot} for {pair}...")
-        try:
-            order_id    = await self._om.add_tp_order(pair, price, qty, slot)
-            price_label = "CMP (market)" if price == 0.0 else f"${_fmt(price)}"
-            await query.edit_message_text(
-                f"<b>TP{slot} PLACED</b>  ✅\n"
-                f"<code>{sep}</code>\n\n"
-                f"  <b>{pair}</b>\n"
-                f"  <code>Slot   </code>  TP{slot}\n"
-                f"  <code>Price  </code>  {price_label}\n"
-                f"  <code>Qty    </code>  {qty} tokens\n"
-                f"  <code>Order  </code>  <code>{order_id}</code>",
-                parse_mode="HTML",
-            )
-        except (ValueError, APIError) as e:
-            await query.edit_message_text(
-                f"<b>FAILED TO PLACE TP{slot}</b>\n\n<code>{e}</code>",
-                parse_mode="HTML",
-            )
-
-    # ── /dca — add DCA entry with independent risk sizing ─────────────────────
-
-    @auth_required
-    async def cmd_dca(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """
-        Add a DCA entry to a tracked trade.
-        Usage: /dca PAIR PRICE RISK NEW_SL
-        """
-        sep  = "─" * 28
-        args = context.args or []
-
-        if len(args) < 4:
-            await update.message.reply_text(
-                f"<b>ADD DCA</b>\n"
-                f"<code>{sep}</code>\n\n"
-                f"  <code>/dca PAIR PRICE RISK NEW_SL</code>\n\n"
-                f"  <b>PRICE</b>   — DCA limit entry price\n"
-                f"  <b>RISK</b>    — additional risk  <code>3%</code> or <code>150$</code>\n"
-                f"  <b>NEW_SL</b>  — new combined stop loss price\n\n"
-                f"  <i>Bot calculates token qty from RISK ÷ (PRICE − NEW_SL)\n"
-                f"  and moves your exchange SL to NEW_SL.</i>",
-                parse_mode="HTML",
-            )
-            return
-
-        pair = args[0].upper()
-        trade = self._om.get_active_trade(pair)
-        if not trade:
-            await update.message.reply_text(
-                f"<b>NOT FOUND</b>  No active trade for <b>{pair}</b>.\n\n"
-                f"  Use /sync to import it first.",
-                parse_mode="HTML",
-            )
-            return
-
-        if trade.dca_order_id:
-            await update.message.reply_text(
-                f"<b>DCA ALREADY SET</b>  {pair} already has a pending DCA order.\n\n"
-                f"  Cancel it with <code>/cancelpair {pair}</code> first.",
-                parse_mode="HTML",
-            )
-            return
-
-        try:
-            dca_price = float(args[1])
-            if dca_price <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("<b>INVALID PRICE</b>  Enter a positive number.", parse_mode="HTML")
-            return
-
-        if trade.entry > 0:
-            if trade.side == Side.LONG and dca_price >= trade.entry:
-                await update.message.reply_text(
-                    f"<b>INVALID DCA</b>  ${_fmt(dca_price)} must be <b>below</b> entry ${_fmt(trade.entry)} for LONG.",
-                    parse_mode="HTML",
-                )
-                return
-            if trade.side == Side.SHORT and dca_price <= trade.entry:
-                await update.message.reply_text(
-                    f"<b>INVALID DCA</b>  ${_fmt(dca_price)} must be <b>above</b> entry ${_fmt(trade.entry)} for SHORT.",
-                    parse_mode="HTML",
-                )
-                return
-
-        try:
-            risk_value, risk_type_str = parse_risk(args[2])
-        except ValueError as e:
-            await update.message.reply_text(
-                f"<b>INVALID RISK</b>  {e}\n\n  Use <code>3%</code> or <code>150$</code>.",
-                parse_mode="HTML",
-            )
-            return
-
-        try:
-            new_sl = float(args[3])
-            if new_sl <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("<b>INVALID SL</b>  Enter a positive number.", parse_mode="HTML")
-            return
-
-        if trade.side == Side.LONG and new_sl >= dca_price:
-            await update.message.reply_text(
-                f"<b>INVALID SL</b>  ${_fmt(new_sl)} must be <b>below</b> DCA price ${_fmt(dca_price)} for LONG.",
-                parse_mode="HTML",
-            )
-            return
-        if trade.side == Side.SHORT and new_sl <= dca_price:
-            await update.message.reply_text(
-                f"<b>INVALID SL</b>  ${_fmt(new_sl)} must be <b>above</b> DCA price ${_fmt(dca_price)} for SHORT.",
-                parse_mode="HTML",
-            )
-            return
-
-        msg = await update.message.reply_text("⏳ Calculating DCA sizing...")
-        try:
-            if risk_type_str == "percent":
-                equity = await self._client.get_total_balance()
-                s = get_settings()
-                base = s.risk_balance if s.risk_balance > 0 else equity
-                risk_amount = base * risk_value / 100.0
-            else:
-                risk_amount = risk_value
-
-            stop_distance = abs(dca_price - new_sl)
-            if stop_distance == 0:
-                await msg.edit_text("<b>INVALID</b>  DCA price and SL price cannot be the same.", parse_mode="HTML")
-                return
-
-            sym_info  = await self._client.get_symbol_info(pair)
-            qp        = sym_info["basePrecision"]
-            min_qty   = sym_info["minTradeVolume"]
-            raw_qty   = risk_amount / stop_distance
-            dca_qty   = round(raw_qty, qp)
-
-            if dca_qty < min_qty:
-                await msg.edit_text(
-                    f"<b>QTY TOO SMALL</b>  Calculated {dca_qty} tokens is below exchange minimum {min_qty}.\n\n"
-                    f"  Increase risk amount or widen the stop distance.",
-                    parse_mode="HTML",
-                )
-                return
-
-            dca_notional = dca_qty * dca_price
-            side_tag     = "🟢 LONG" if trade.side == Side.LONG else "🔴 SHORT"
-
-            # Strategy multiplier qty (neil=2×, saltwayer=2.5×)
-            strategy   = trade.strategy or ""
-            mult       = 2.0 if strategy == "neil" else (2.5 if strategy == "saltwayer" else None)
-            mult_label = f"{mult}×" if mult else None
-
-            # Option A: lock qty to entry×mult, derive risk
-            mult_qty  = round(trade.position_size * mult, qp) if mult else None
-            mult_risk = round(mult_qty * stop_distance, 2) if mult_qty else None
-
-            # Option B: combined formula — back-calculate corrected entry qty
-            # so that entry_risk + dca_risk = target_risk exactly, with dca=M×entry
-            # entry_dist = |entry - new_sl|, dca_dist = |dca_price - new_sl|
-            # dca_qty_corrected = M × target_risk / (entry_dist + M × dca_dist)
-            corr_qty      = None
-            corr_risk     = None
-            corr_entry_qty = None
-            if mult and trade.entry:
-                is_long = trade.side == Side.LONG
-                entry_dist = (trade.entry - new_sl) if is_long else (new_sl - trade.entry)
-                dca_dist   = (dca_price - new_sl)   if is_long else (new_sl - dca_price)
-                denom = entry_dist + mult * dca_dist
-                if denom > 0:
-                    corr_entry_qty = risk_amount / denom
-                    corr_qty       = round(corr_entry_qty * mult, qp)
-                    corr_risk      = round(corr_qty * dca_dist, 2)
-                    corr_total     = round(corr_entry_qty * entry_dist + corr_qty * dca_dist, 2)
-
-            # Build keyboard
-            kb_rows = []
-            if mult_qty and mult_qty >= min_qty:
-                kb_rows.append([InlineKeyboardButton(
-                    f"📏  {mult_label}× entry size ({mult_qty} tokens)",
-                    callback_data=f"adddca:confirm:{pair}:{dca_price}:{mult_qty}:{new_sl}:{mult_risk:.2f}"
-                )])
-            if corr_qty and corr_qty >= min_qty:
-                kb_rows.append([InlineKeyboardButton(
-                    f"🎯  Exact {risk_amount:,.2f}$ total ({corr_qty} tokens)",
-                    callback_data=f"adddca:confirm:{pair}:{dca_price}:{corr_qty}:{new_sl}:{corr_risk:.2f}"
-                )])
-            kb_rows.append([InlineKeyboardButton(
-                f"📐  Risk-sized ({dca_qty} tokens)",
-                callback_data=f"adddca:confirm:{pair}:{dca_price}:{dca_qty}:{new_sl}:{risk_amount:.2f}"
-            )])
-            kb_rows.append([InlineKeyboardButton("✖  Cancel", callback_data="adddca:cancel")])
-            kb = InlineKeyboardMarkup(kb_rows)
-
-            strategy_line = ""
-            if mult and trade.entry:
-                if mult_qty and mult_qty >= min_qty:
-                    strategy_line += (
-                        f"  <code>{'Mult sized':<11}</code>  {mult_label} entry = {mult_qty} tokens  →  risk ${mult_risk:,.2f}\n"
-                    )
-                if corr_qty and corr_qty >= min_qty:
-                    strategy_line += (
-                        f"  <code>{'Exact 5%':<11}</code>  corrected = {corr_qty} tokens  →  DCA risk ${corr_risk:,.2f}  (total ${corr_total:,.2f})\n"
-                    )
-
-            await msg.edit_text(
-                f"<b>DCA SUMMARY — {pair}</b>\n"
-                f"<code>{sep}</code>\n\n"
-                f"  {side_tag}\n\n"
-                f"  <code>Entry      </code>  {trade.position_size} tokens @ ${_fmt(trade.entry)}\n"
-                f"  <code>DCA Price  </code>  ${_fmt(dca_price)}\n"
-                f"  <code>New SL     </code>  ${_fmt(new_sl)}\n"
-                f"  <code>Old SL     </code>  ${_fmt(trade.sl)}\n"
-                f"  <code>Risk input </code>  ${risk_amount:,.2f}\n"
-                f"<code>{'─'*28}</code>\n"
-                f"{strategy_line}"
-                f"  <code>{'Risk-sized':<11}</code>  {dca_qty} tokens  →  risk ${risk_amount:,.2f}\n\n"
-                f"  <i>🎯 Exact uses combined formula so entry+DCA = ${risk_amount:,.2f} exactly at new SL.</i>",
-                parse_mode="HTML",
-                reply_markup=kb,
-            )
-
-        except APIError as e:
-            await msg.edit_text(M.api_error("DCA sizing", e), parse_mode="HTML")
-        except Exception as e:
-            logger.error(f"cmd_dca sizing error: {e}", exc_info=True)
-            await msg.edit_text(f"<b>ERROR</b>  <code>{e}</code>", parse_mode="HTML")
-
-
-    @auth_required
-    async def cmd_fixtp(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """
-        /fixtp PAIR
-        Cancel existing TP orders and re-place them proportionally
-        based on live position size from exchange.
-        """
-        sep  = "─" * 28
-        args = context.args or []
-        if not args:
-            await update.message.reply_text(
-                f"<b>FIX TP PROPORTIONS</b>\n"
-                f"<code>{sep}</code>\n\n"
-                f"  <code>/fixtp PAIR</code>\n\n"
-                f"  Cancels existing TP orders and re-places them\n"
-                f"  correctly sized against the live position on exchange.",
-                parse_mode="HTML",
-            )
-            return
-
-        pair  = args[0].upper()
-        trade = self._om.get_active_trade(pair)
-        if not trade:
-            await update.message.reply_text(
-                f"<b>NOT FOUND</b>  No active trade for <b>{pair}</b>.\n\n"
-                f"  Use /sync to import it first.",
-                parse_mode="HTML",
-            )
-            return
-
-        msg = await update.message.reply_text(f"⏳ Rebalancing TPs for {pair}...")
-        try:
-            result = await self._om.rebalance_tps(pair)
-            s      = get_settings()
-            tp1_p  = int(s.tp1_pct * 100)
-            tp2_p  = int(s.tp2_pct * 100)
-            tp3_p  = 100 - tp1_p - tp2_p
-            await msg.edit_text(
-                f"<b>TP REBALANCED</b>  ✅\n"
-                f"<code>{sep}</code>\n\n"
-                f"  <b>{pair}</b>\n\n"
-                f"  <code>Live qty   </code>  {result['total_qty']}\n"
-                f"  <code>TP1 ({tp1_p}%)  </code>  {result['tp1_qty']} tokens  @  ${_fmt(trade.tp1)}\n"
-                + (f"  <code>TP2 ({tp2_p}%)  </code>  {result['tp2_qty']} tokens  @  ${_fmt(trade.tp2)}\n" if result['tp2_qty'] else "")
-                + (f"  <code>TP3 ({tp3_p}%)  </code>  {result['tp3_qty']} tokens  @  ${_fmt(trade.tp3)}\n" if result['tp3_qty'] else "")
-                + f"\n  <i>TP orders re-placed on exchange.</i>",
-                parse_mode="HTML",
-            )
-        except (ValueError, APIError) as e:
-            await msg.edit_text(
-                f"<b>FIXTP FAILED</b>\n\n<code>{e}</code>",
-                parse_mode="HTML",
-            )
-
-    @auth_required
-    async def _handle_adddca(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        data = query.data
-
-        if data == "adddca:cancel":
-            await query.edit_message_text("<b>DCA CANCELLED</b>", parse_mode="HTML")
-            return
-
-        try:
-            parts     = data.split(":")
-            pair      = parts[2]
-            dca_price = float(parts[3])
-            dca_qty   = float(parts[4])
-            new_sl    = float(parts[5])
-            risk_amt  = float(parts[6])
-        except Exception:
-            await query.edit_message_text("<b>ERROR</b>  Malformed callback data.", parse_mode="HTML")
-            return
-
-        sep = "─" * 28
-        await query.edit_message_text(f"⏳ Placing DCA for {pair}...")
-        try:
-            order_id = await self._om.add_dca_order(pair, dca_price, dca_qty, new_sl)
-            await query.edit_message_text(
-                f"<b>DCA PLACED</b>  ✅\n"
-                f"<code>{sep}</code>\n\n"
-                f"  <b>{pair}</b>\n"
-                f"  <code>DCA Price  </code>  ${_fmt(dca_price)}\n"
-                f"  <code>Qty        </code>  {dca_qty} tokens\n"
-                f"  <code>Risk       </code>  ${risk_amt:,.2f}\n"
-                f"  <code>New SL     </code>  ${_fmt(new_sl)}\n"
-                f"  <code>Order      </code>  <code>{order_id}</code>\n\n"
-                f"  <i>DCA order live. SL moved to ${_fmt(new_sl)}.</i>",
-                parse_mode="HTML",
-            )
-        except (ValueError, APIError) as e:
-            await query.edit_message_text(
-                f"<b>DCA FAILED</b>\n\n<code>{e}</code>",
-                parse_mode="HTML",
-            )
-
     async def cmd_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         known = {
             "/start", "/help", "/commands", "/balance", "/positions",
             "/closeall", "/cancelpair", "/trade", "/history", "/stats",
-            "/cancel", "/debug", "/settings", "/sync", "/resync", "/modifysl", "/movesl", "/setsl", "/setleverage", "/setstrategy", "/tp", "/dca",
+            "/cancel", "/debug", "/settings", "/sync", "/resync", "/modifysl", "/movesl", "/setsl", "/setleverage", "/setstrategy",
         }
         text = update.message.text or ""
         cmd  = text.split()[0].lower().split("@")[0]

@@ -49,16 +49,10 @@ class UserSettings:
     confirmation_required: bool = True
     close_all_confirmation: bool = True
     auto_move_sl_to_be:     bool = False   # move SL to breakeven after TP1
-    trailing_sl:            bool = False   # trailing stop loss
 
     # Notifications
     notify_tp_hits:  bool = True
     notify_sl_hits:  bool = True
-    notify_pnl_pct:  float = 5.0   # alert when unrealised PnL > X%
-
-    # Display
-    currency_symbol: str = "USDT"
-    compact_mode:    bool = False   # shorter messages
 
     def save(self) -> None:
         with open(SETTINGS_PATH, "w") as f:
@@ -106,7 +100,6 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔔  Notifications",     callback_data="cfg:menu:notify"),
         ],
         [
-            InlineKeyboardButton("🖥  Display",           callback_data="cfg:menu:display"),
             InlineKeyboardButton("↩️  Reset to defaults", callback_data="cfg:reset"),
         ],
     ])
@@ -227,8 +220,6 @@ def _behaviour_text() -> str:
         f"  <i>Require confirmation for /closeall</i>\n\n"
         f"  <code>{'Auto SL → Breakeven':<22}</code>  {'✅ ON' if s.auto_move_sl_to_be else '⬜ OFF'}\n"
         f"  <i>Move SL to entry price after TP1 hits</i>\n\n"
-        f"  <code>{'Trailing SL':<22}</code>  {'✅ ON' if s.trailing_sl else '⬜ OFF'}\n"
-        f"  <i>Trail SL as price moves in your favour</i>"
     )
 
 
@@ -238,7 +229,6 @@ def _behaviour_kb() -> InlineKeyboardMarkup:
         [_toggle_btn("Trade confirm",     s.confirmation_required,  "confirmation_required")],
         [_toggle_btn("Close-all confirm", s.close_all_confirmation, "close_all_confirmation")],
         [_toggle_btn("Auto SL → BE",      s.auto_move_sl_to_be,     "auto_move_sl_to_be")],
-        [_toggle_btn("Trailing SL",       s.trailing_sl,             "trailing_sl")],
         [InlineKeyboardButton("◀  Back", callback_data="cfg:menu:main")],
     ])
 
@@ -252,8 +242,6 @@ def _notify_text() -> str:
         f"  <i>Notify when a take profit fills</i>\n\n"
         f"  <code>{'SL hit alerts':<20}</code>  {'✅ ON' if s.notify_sl_hits else '⬜ OFF'}\n"
         f"  <i>Notify when stop loss fills</i>\n\n"
-        f"  <code>{'PnL alert %':<20}</code>  <b>{s.notify_pnl_pct:.1f}%</b>\n"
-        f"  <i>Alert when unrealised PnL crosses ±this %</i>"
     )
 
 
@@ -262,29 +250,11 @@ def _notify_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [_toggle_btn("TP hit alerts", s.notify_tp_hits, "notify_tp_hits")],
         [_toggle_btn("SL hit alerts", s.notify_sl_hits, "notify_sl_hits")],
-        _inc_dec_row("PnL alert %", "notify_pnl_pct", s.notify_pnl_pct, 1.0, ".1f"),
         [InlineKeyboardButton("◀  Back", callback_data="cfg:menu:main")],
     ])
 
 
-def _display_text() -> str:
-    s = _settings
-    return (
-        f"<b>DISPLAY</b>\n"
-        f"<code>{HDIV}</code>\n\n"
-        f"  <code>{'Compact mode':<20}</code>  {'✅ ON' if s.compact_mode else '⬜ OFF'}\n"
-        f"  <i>Shorter messages, less detail</i>\n\n"
-        f"  <code>{'Currency':<20}</code>  <b>{s.currency_symbol}</b>\n"
-        f"  <i>Display label (cosmetic only)</i>"
-    )
 
-
-def _display_kb() -> InlineKeyboardMarkup:
-    s = _settings
-    return InlineKeyboardMarkup([
-        [_toggle_btn("Compact mode", s.compact_mode, "compact_mode")],
-        [InlineKeyboardButton("◀  Back", callback_data="cfg:menu:main")],
-    ])
 
 
 # ── Handler class ─────────────────────────────────────────────────────────────
@@ -466,7 +436,6 @@ class SettingsHandler:
             "tp":        (_tp_text,        _tp_kb),
             "behaviour": (_behaviour_text, _behaviour_kb),
             "notify":    (_notify_text,    _notify_kb),
-            "display":   (_display_text,   _display_kb),
         }
         text_fn, kb_fn = pages.get(page, pages["main"])
         await query.edit_message_text(
@@ -490,7 +459,6 @@ class SettingsHandler:
         bounds = {
             "default_risk_pct":  (0.1, 20.0),
             "risk_balance":      (0.0, 1_000_000.0),
-            "notify_pnl_pct":    (0.5, 50.0),
         }
         if hasattr(_settings, key):
             lo, hi   = bounds.get(key, (0, 999999))
@@ -508,12 +476,10 @@ class SettingsHandler:
     def _page_for_key(key: str) -> str:
         risk_keys     = {"default_risk_pct","risk_balance"}
         tp_keys       = {"tp1_pct","tp2_pct","tp3_pct","tp1_pct_int","tp2_pct_int","tp3_pct_int"}
-        behaviour_keys= {"confirmation_required","close_all_confirmation","auto_move_sl_to_be","trailing_sl"}
-        notify_keys   = {"notify_tp_hits","notify_sl_hits","notify_pnl_pct"}
-        display_keys  = {"compact_mode","currency_symbol"}
+        behaviour_keys= {"confirmation_required","close_all_confirmation","auto_move_sl_to_be"}
+        notify_keys   = {"notify_tp_hits","notify_sl_hits"}
         if key in risk_keys:      return "risk"
         if key in tp_keys:        return "tp"
         if key in behaviour_keys: return "behaviour"
         if key in notify_keys:    return "notify"
-        if key in display_keys:   return "display"
         return "main"
