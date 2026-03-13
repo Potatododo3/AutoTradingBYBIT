@@ -2,7 +2,7 @@
 OrderManager — trade lifecycle: open, close, sync, cancel.
 
 TP/SL strategy:
-  - Uses Bitunix's native TPSL system (tied to positionId) for SL and TP3.
+  - Uses Bybit's trading-stop endpoint for SL. positionIdx stored as position_id.
   - TP1 and TP2 are placed as regular limit reduce-only orders (partial closes).
 
 Manual trade sync (/sync):
@@ -15,7 +15,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from bitunix_client import BitunixClient
+from bybit_client import BybitClient
 from database import Database
 from journal import Journal
 from models import (
@@ -82,7 +82,7 @@ def _safe_tp_qtys(
 
 
 class OrderManager:
-    def __init__(self, client: BitunixClient, db: Database, journal: "Journal") -> None:
+    def __init__(self, client: BybitClient, db: Database, journal: "Journal") -> None:
         self._client = client
         self._db = db
         self._jnl = journal
@@ -93,6 +93,13 @@ class OrderManager:
         self._cache = await self._db.get_active_trades()
         if self._cache:
             logger.info(f"Restored {len(self._cache)} trade(s): {', '.join(self._cache)}")
+            # Restore seen_close_orders from DB so partial-close detections survive restarts
+            for trade in self._cache.values():
+                if trade.seen_close_ids:
+                    ids = {s for s in trade.seen_close_ids.split(",") if s}
+                    self._seen_close_orders.update(ids)
+            if self._seen_close_orders:
+                logger.info(f"Restored {len(self._seen_close_orders)} seen close order ID(s) from DB")
         else:
             logger.info("No active trades in DB.")
         # Reconcile any trades that had unfilled limit entries when bot was last stopped
@@ -459,7 +466,7 @@ class OrderManager:
                 f"[{t.trade_id}] {t.pair} no longer on exchange — marking closed "
                 f"(likely closed via app, TP hit, or SL hit)"
             )
-            # Fetch exit price + PnL from order history
+            # Fetch exit price + PnL from order history (same as _reconcile_closed_externally)
             try:
                 start_ms = int(t.opened_at.timestamp() * 1000)
                 hist_orders = await self._client.get_history_orders(
@@ -754,7 +761,7 @@ class OrderManager:
             try:
                 if not position.position_id:
                     raise APIError("No positionId available for flash close")
-                await self._client.flash_close_position(position.position_id)
+                await self._client.flash_close_position(position.position_id, symbol=pair, side=position.side)
             except APIError:
                 # Fallback: manual market close with positionId for hedge mode
                 await self._client.close_position(
@@ -815,19 +822,9 @@ class OrderManager:
         old_sl = trade.sl
 
         if trade.position_id:
-            if trade.sl_order_id:
-                # Existing TPSL order — modify it in place
-                await self._client.modify_position_tpsl(
-                    symbol=pair, position_id=trade.position_id, sl_price=new_sl,
-                )
-            else:
-                # No TPSL order yet (trade opened without SL, or SL was never placed)
-                # Must create a new TPSL order instead of modifying
-                new_tpsl_id = await self._client.place_tpsl(
-                    symbol=pair, position_id=trade.position_id, sl_price=new_sl,
-                )
-                trade.sl_order_id = new_tpsl_id
-                logger.info(f"[{trade.trade_id}] No existing TPSL — placed new SL order {new_tpsl_id} for {pair}")
+            await self._client.modify_position_tpsl(
+                symbol=pair, position_id=trade.position_id, sl_price=new_sl,
+            )
         else:
             # Fallback: cancel old SL limit, place new one
             if trade.sl_order_id:
@@ -1056,6 +1053,16 @@ class OrderManager:
             except Exception as e:
                 logger.error(f"TP fill poller error: {e}", exc_info=True)
 
+    async def _persist_seen_close_id(self, trade: "TradeRecord", order_id: str) -> None:
+        """Add order_id to trade.seen_close_ids and persist to DB."""
+        existing = set(s for s in (trade.seen_close_ids or "").split(",") if s)
+        existing.add(order_id)
+        trade.seen_close_ids = ",".join(existing)
+        try:
+            await self._db.update_seen_close_ids(trade.trade_id, trade.seen_close_ids)
+        except Exception as e:
+            logger.warning(f"[{trade.trade_id}] Failed to persist seen_close_id {order_id}: {e}")
+
     async def _check_tp_fills(self, notify_callback) -> None:
         """
         For each active trade, check if TP1/TP2/TP3 orders have filled.
@@ -1107,22 +1114,22 @@ class OrderManager:
                     )
 
                     # Notify Telegram
-                    if s.notify_tp_hits:
-                        from messages import _fmt
-                        side_lbl = "🟢 LONG" if trade.side == Side.LONG else "🔴 SHORT"
-                        await notify_callback(
-                            f"<b>TP{tp_num} FILLED</b>  ✅\n"
-                            f"<code>{'─'*28}</code>\n\n"
-                            f"  <b>{pair}</b>  {side_lbl}\n"
-                            f"  <code>Fill price   </code>  ${_fmt(tp_price)}\n"
-                            f"  <code>Qty closed   </code>  {filled_qty}\n"
-                            f"  <code>Remaining    </code>  {remaining}"
-                        )
+                    from messages import _fmt
+                    side_lbl = "🟢 LONG" if trade.side == Side.LONG else "🔴 SHORT"
+                    await notify_callback(
+                        f"<b>TP{tp_num} FILLED</b>  ✅\n"
+                        f"<code>{'─'*28}</code>\n\n"
+                        f"  <b>{pair}</b>  {side_lbl}\n"
+                        f"  <code>Fill price   </code>  ${_fmt(tp_price)}\n"
+                        f"  <code>Qty closed   </code>  {filled_qty}\n"
+                        f"  <code>Remaining    </code>  {remaining}"
+                    )
 
                     # Clear the order_id and add to seen set so close poller
                     # won't re-classify it as an unknown close
                     if order_id:
                         self._seen_close_orders.add(order_id)
+                        await self._persist_seen_close_id(trade, order_id)
                     setattr(trade, order_id_attr, "")
                     await self._db.update_trade(trade)
 
@@ -1263,25 +1270,21 @@ class OrderManager:
                         icon  = icons.get(reason, "📭")
                         label = labels.get(reason, "POSITION CLOSED")
                         sign  = "+" if net_pnl >= 0 else ""
-                        _should_notify = (
-                            s.notify_sl_hits if reason == "sl_hit"
-                            else True  # always notify for tp3, manual, liquidated, unknown
+                        await notify_callback(
+                            f"<b>{icon} {label}</b>\n"
+                            f"<code>{'─'*28}</code>\n\n"
+                            f"  <b>{pair}</b>  {side_lbl}\n"
+                            f"  <code>Entry        </code>  ${_fmt(trade.entry)}\n"
+                            f"  <code>Close        </code>  ${_fmt(fill_price)}\n"
+                            f"  <code>Net PnL      </code>  {sign}${net_pnl:.2f}"
                         )
-                        if _should_notify:
-                            await notify_callback(
-                                f"<b>{icon} {label}</b>\n"
-                                f"<code>{'─'*28}</code>\n\n"
-                                f"  <b>{pair}</b>  {side_lbl}\n"
-                                f"  <code>Entry        </code>  ${_fmt(trade.entry)}\n"
-                                f"  <code>Close        </code>  ${_fmt(fill_price)}\n"
-                                f"  <code>Net PnL      </code>  {sign}${net_pnl:.2f}"
-                            )
                         break  # position is gone, no point processing more orders
 
                     else:
                         # Partial close (e.g. TP hit but position still open)
-                        # Track in memory so we don't re-fire on next poll
+                        # Persist to DB so this order isn't re-detected on restart
                         self._seen_close_orders.add(order_id)
+                        await self._persist_seen_close_id(trade, order_id)
                         logger.info(
                             f"[{trade.trade_id}] {pair} partial close detected "
                             f"@ {fill_price} qty={fill_qty} — position still open"
@@ -1293,44 +1296,66 @@ class OrderManager:
                 logger.error(f"[{trade.trade_id}] {pair} close poll error: {e}", exc_info=True)
 
 
-    async def add_tp_order(self, pair: str, price: float, qty: float, slot: int) -> str:
+
+
+    # ── /tp — add take-profit order ───────────────────────────────────────────
+
+    async def add_tp_order(
+        self,
+        pair: str,
+        price: float,      # 0.0 = market (CMP)
+        qty: float,
+        tp_slot: int,      # 1, 2, or 3 — which slot to fill
+    ) -> str:
         """
-        Place a take-profit order for an existing tracked trade and record it.
-        price=0 means market (reduceOnly market order).
-        slot: 1, 2, or 3 — which tp slot to assign the order to.
-        Returns order_id.
+        Place a single TP limit (or market) order for qty tokens on pair.
+        Updates trade.tp{n}, trade.tp{n}_order_id and persists to DB.
+        Returns the new order_id.
         """
         trade = self._cache.get(pair)
         if not trade:
-            raise ValueError(f"No active trade for {pair}")
+            raise ValueError(
+                f"No active trade tracked for {pair}.\n"
+                f"Run /sync first if this position was placed in the app."
+            )
+        if not trade.position_id:
+            raise ValueError(
+                f"Trade for {pair} has no positionId yet — wait for entry fill."
+            )
 
-        from models import Side
-        side = "SELL" if trade.side == Side.LONG else "BUY"
-        order_type = "MARKET" if price == 0.0 else "LIMIT"
+        close_side = "SELL" if trade.side == Side.LONG else "BUY"
+        is_market  = price == 0.0
 
         order_id = await self._client.place_order(
             symbol=pair,
-            side=side,
-            order_type=order_type,
+            side=close_side,
+            order_type="MARKET" if is_market else "LIMIT",
             qty=qty,
-            price=price if order_type == "LIMIT" else None,
+            price=None if is_market else price,
             reduce_only=True,
+            trade_side="CLOSE",
+            position_id=trade.position_id,
         )
 
-        # Store in trade record
-        if slot == 1:
-            trade.tp1          = price
+        # Update trade record with new TP price and order id
+        if tp_slot == 1:
+            trade.tp1 = price
             trade.tp1_order_id = order_id
-        elif slot == 2:
-            trade.tp2          = price
+        elif tp_slot == 2:
+            trade.tp2 = price
             trade.tp2_order_id = order_id
-        elif slot == 3:
-            trade.tp3          = price
+        else:
+            trade.tp3 = price
             trade.tp3_order_id = order_id
 
         await self._db.update_trade(trade)
-        logger.info(f"[{trade.trade_id}] add_tp_order TP{slot} {pair} @ {price} qty={qty} id={order_id}")
+        logger.info(
+            f"[{trade.trade_id}] TP{tp_slot} added for {pair}: "
+            f"price={'MARKET' if is_market else price}  qty={qty}  orderId={order_id}"
+        )
         return order_id
+
+    # ── /dca — add DCA order with independent risk sizing ────────────────────
 
     async def rebalance_tps(self, pair: str) -> dict:
         """
@@ -1393,38 +1418,58 @@ class OrderManager:
         )
         return {"tp1_qty": tp1_qty, "tp2_qty": tp2_qty, "tp3_qty": tp3_qty, "total_qty": live_qty}
 
-    async def add_dca_order(self, pair: str, dca_price: float, dca_qty: float, new_sl: float) -> str:
+    async def add_dca_order(
+        self,
+        pair: str,
+        price: float,       # DCA entry price
+        dca_qty: float,     # tokens to buy — caller computes from risk/SL
+        new_sl: float,      # new combined SL to move exchange order to
+    ) -> str:
         """
-        Place a DCA limit entry order for an existing tracked trade.
-        Also moves the exchange SL to new_sl.
-        Returns order_id.
+        Place a DCA limit entry order. Moves the exchange SL to new_sl.
+        Updates trade.dca, trade.dca_order_id, trade.sl and persists to DB.
+        Returns the new dca order_id.
         """
         trade = self._cache.get(pair)
         if not trade:
-            raise ValueError(f"No active trade for {pair}")
+            raise ValueError(
+                f"No active trade tracked for {pair}.\n"
+                f"Run /sync first if this position was placed in the app."
+            )
+        if trade.dca_order_id:
+            raise ValueError(
+                f"{pair} already has a pending DCA order. "
+                f"Cancel it with /cancelpair first."
+            )
 
-        from models import Side
-        side = "BUY" if trade.side == Side.LONG else "SELL"
-
-        order_id = await self._client.place_order(
+        entry_side = "BUY" if trade.side == Side.LONG else "SELL"
+        dca_order_id = await self._client.place_order(
             symbol=pair,
-            side=side,
+            side=entry_side,
             order_type="LIMIT",
             qty=dca_qty,
-            price=dca_price,
-            reduce_only=False,
+            price=price,
+            trade_side="OPEN",
         )
 
-        # Move exchange SL to new_sl
-        await self.modify_sl(pair, new_sl)
+        # Move SL to new combined level
+        old_sl = trade.sl
+        if trade.position_id and new_sl and new_sl > 0:
+            await self._client.modify_position_tpsl(
+                symbol=pair, position_id=trade.position_id, sl_price=new_sl,
+            )
+            trade.sl = new_sl
 
-        # Update trade record
-        trade.dca          = dca_price
-        trade.dca_order_id = order_id
+        trade.dca           = price
+        trade.dca_order_id  = dca_order_id
         await self._db.update_trade(trade)
-        logger.info(f"[{trade.trade_id}] add_dca_order {pair} @ {dca_price} qty={dca_qty} new_sl={new_sl} id={order_id}")
-        return order_id
 
+        logger.info(
+            f"[{trade.trade_id}] DCA added for {pair}: "
+            f"price={price}  qty={dca_qty}  orderId={dca_order_id}  "
+            f"SL moved {old_sl} → {new_sl}"
+        )
+        return dca_order_id
 
 
 def _classify_close(trade, close_price: float, pnl: float) -> str:
