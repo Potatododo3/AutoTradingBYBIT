@@ -1114,16 +1114,17 @@ class OrderManager:
                     )
 
                     # Notify Telegram
-                    from messages import _fmt
-                    side_lbl = "🟢 LONG" if trade.side == Side.LONG else "🔴 SHORT"
-                    await notify_callback(
-                        f"<b>TP{tp_num} FILLED</b>  ✅\n"
-                        f"<code>{'─'*28}</code>\n\n"
-                        f"  <b>{pair}</b>  {side_lbl}\n"
-                        f"  <code>Fill price   </code>  ${_fmt(tp_price)}\n"
-                        f"  <code>Qty closed   </code>  {filled_qty}\n"
-                        f"  <code>Remaining    </code>  {remaining}"
-                    )
+                    if s.notify_tp_hits:
+                        from messages import _fmt
+                        side_lbl = "🟢 LONG" if trade.side == Side.LONG else "🔴 SHORT"
+                        await notify_callback(
+                            f"<b>TP{tp_num} FILLED</b>  ✅\n"
+                            f"<code>{'─'*28}</code>\n\n"
+                            f"  <b>{pair}</b>  {side_lbl}\n"
+                            f"  <code>Fill price   </code>  ${_fmt(tp_price)}\n"
+                            f"  <code>Qty closed   </code>  {filled_qty}\n"
+                            f"  <code>Remaining    </code>  {remaining}"
+                        )
 
                     # Clear the order_id and add to seen set so close poller
                     # won't re-classify it as an unknown close
@@ -1270,14 +1271,19 @@ class OrderManager:
                         icon  = icons.get(reason, "📭")
                         label = labels.get(reason, "POSITION CLOSED")
                         sign  = "+" if net_pnl >= 0 else ""
-                        await notify_callback(
-                            f"<b>{icon} {label}</b>\n"
-                            f"<code>{'─'*28}</code>\n\n"
-                            f"  <b>{pair}</b>  {side_lbl}\n"
-                            f"  <code>Entry        </code>  ${_fmt(trade.entry)}\n"
-                            f"  <code>Close        </code>  ${_fmt(fill_price)}\n"
-                            f"  <code>Net PnL      </code>  {sign}${net_pnl:.2f}"
+                        _should_notify = (
+                            s.notify_sl_hits if reason == "sl_hit"
+                            else True  # always notify for tp3, manual, liquidated, unknown
                         )
+                        if _should_notify:
+                            await notify_callback(
+                                f"<b>{icon} {label}</b>\n"
+                                f"<code>{'─'*28}</code>\n\n"
+                                f"  <b>{pair}</b>  {side_lbl}\n"
+                                f"  <code>Entry        </code>  ${_fmt(trade.entry)}\n"
+                                f"  <code>Close        </code>  ${_fmt(fill_price)}\n"
+                                f"  <code>Net PnL      </code>  {sign}${net_pnl:.2f}"
+                            )
                         break  # position is gone, no point processing more orders
 
                     else:
