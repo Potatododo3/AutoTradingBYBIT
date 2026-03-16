@@ -230,11 +230,5 @@ class SoftSLMonitor:
         )
 
         if breached:
-            # Auto-set 2-candle cooldown on breach so alerts don't spam
-            # User clicking Ignore will call notify_cooldown_ignored which extends it
-            cd2 = self._cooldowns.setdefault(key, CooldownState())
-            cd2.alert_sent_at_candle = candle_ts
-            cd2.ignore_until_candle  = candle_ts + 2 * period * 1000  # 2 candles in ms
-
             logger.info(f"SoftSL BREACH [{timeframe}] {pair}: alerting user")
             await self._on_breach(trade, timeframe, close_price, candle_ts)

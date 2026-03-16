@@ -1338,13 +1338,12 @@ class BotHandlers:
         elif action == "ignore":
             timeframe = parts[3]
             candle_ts = int(parts[4])
-            self._soft_sl_monitor.notify_cooldown_ignored(pair, timeframe, candle_ts)
             sep = "─" * 28
             await query.edit_message_text(
                 f"<b>IGNORED</b>  ⏩\n"
                 f"<code>{sep}</code>\n\n"
                 f"  Alert for <b>{pair}</b> dismissed.\n"
-                f"  No re-alert for 2 more {timeframe} candles.\n\n"
+                f"  Will alert again on the next {timeframe} candle close.\n\n"
                 f"  Use <code>/setsl {pair} PRICE {timeframe}</code> to update the level.",
                 parse_mode="HTML",
             )
