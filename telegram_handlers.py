@@ -319,6 +319,7 @@ class BotHandlers:
                 InlineKeyboardButton("📐  Neil",       callback_data="strategy:neil"),
                 InlineKeyboardButton("🌊  Saltwayer",  callback_data="strategy:saltwayer"),
             ],
+            [InlineKeyboardButton("🔍  Sherlock",     callback_data="strategy:sherlock")],
             [InlineKeyboardButton("⬜  No strategy", callback_data="strategy:none")],
             [InlineKeyboardButton("✖  Abort trade",  callback_data="wizard:cancel")],
         ])
@@ -327,8 +328,9 @@ class BotHandlers:
             f"<code>{'═'*28}</code>\n\n"
             f"{_trail({'pair': d['pair'], 'side': d['_side_label']})}"
             f"  <b>STRATEGY</b>\n\n"
-            f"  <b>Neil</b>  —  DCA is 2× entry token size\n"
-            f"  <b>Saltwayer</b>  —  DCA is 2.5× entry token size\n"
+            f"  <b>Neil</b>  —  DCA is 2× entry size\n"
+            f"  <b>Saltwayer</b>  —  DCA is 2.5× entry size\n"
+            f"  <b>Sherlock</b>  —  DCA matches entry size (1×), optional\n"
             f"  <b>None</b>  —  enter DCA size manually",
             parse_mode="HTML", reply_markup=kb,
         )
@@ -342,19 +344,21 @@ class BotHandlers:
         d = context.user_data[TRADE_KEY]
         d["strategy"] = None if strategy == "none" else strategy
 
-        strategy_labels = {"neil": "📐 Neil", "saltwayer": "🌊 Saltwayer", "none": "—"}
+        strategy_labels = {"neil": "📐 Neil", "saltwayer": "🌊 Saltwayer", "sherlock": "🔍 Sherlock", "none": "—"}
         strategy_label  = strategy_labels.get(strategy, "—")
         d["_strategy_label"] = strategy_label
-        # Neil/Saltwayer now act as a tag only.
-        # DCA multiplier (2×/2.5×) is applied in _build_confirm IF a DCA price is entered.
+        # Neil/Saltwayer/Sherlock act as a tag only.
+        # DCA multiplier is applied in _build_confirm IF a DCA price is entered.
 
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⚡  Market order  (fill immediately)", callback_data="entry:market")],
             [InlineKeyboardButton("✖  Abort trade", callback_data="wizard:cancel")],
         ])
         strat_note = ""
-        if strategy in ("neil", "saltwayer"):
-            mult = "2×" if strategy == "neil" else "2.5×"
+        if strategy in ("neil", "saltwayer", "sherlock"):
+            if strategy == "neil":      mult = "2×"
+            elif strategy == "saltwayer": mult = "2.5×"
+            else:                         mult = "1× (optional DCA)"
             strat_note = (
                 f"\n  <i>{strategy_labels[strategy]} tag applied — if you add a DCA price,\n"
                 f"  the DCA order will be sized at {mult} your entry qty.</i>"
@@ -779,6 +783,8 @@ class BotHandlers:
                 d["dca_qty"] = 2.0   # multiplier
             elif dca_price and strategy == "saltwayer":
                 d["dca_qty"] = 2.5   # multiplier
+            elif dca_price and strategy == "sherlock":
+                d["dca_qty"] = 1.0   # equal size entry and DCA
             else:
                 d["dca_qty"] = None  # same size as entry
 
