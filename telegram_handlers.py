@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 # ── Conversation states ───────────────────────────────────────────────────────
 (
     ASK_PAIR, ASK_SIDE, ASK_STRATEGY, ASK_ENTRY, ASK_RISK,
-    ASK_SL, ASK_SL_TIMEFRAME, ASK_TP1, ASK_TP2, ASK_TP3, ASK_DCA, CONFIRM_TRADE,
-) = range(12)
+    ASK_SL, ASK_SL_TYPE, ASK_SL_TIMEFRAME, ASK_TP1, ASK_TP2, ASK_TP3, ASK_DCA, CONFIRM_TRADE,
+) = range(13)
 
 TRADE_KEY = "trade_wizard"
 
@@ -145,6 +145,10 @@ class BotHandlers:
                 ASK_SL:    [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.trade_sl),
                     CallbackQueryHandler(self._wiz_cancel,  pattern="^wizard:cancel$"),
+                ],
+                ASK_SL_TYPE: [
+                    CallbackQueryHandler(self.trade_sl_type, pattern="^sltype:"),
+                    CallbackQueryHandler(self._wiz_cancel,   pattern="^wizard:cancel$"),
                 ],
                 ASK_SL_TIMEFRAME: [
                     CallbackQueryHandler(self.trade_sl_timeframe, pattern="^sltf:"),
@@ -502,31 +506,82 @@ class BotHandlers:
         d = context.user_data[TRADE_KEY]
         d["sl"] = sl
 
+        sl_str = f"${_fmt(sl)}"
         kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("15m",   callback_data="sltf:15m"),
-                InlineKeyboardButton("30m",   callback_data="sltf:30m"),
-                InlineKeyboardButton("1h",    callback_data="sltf:1h"),
-            ],
-            [
-                InlineKeyboardButton("4h",    callback_data="sltf:4h"),
-                InlineKeyboardButton("Daily", callback_data="sltf:Daily"),
+                InlineKeyboardButton("🔒  Hard SL  (exchange order)", callback_data="sltype:hard"),
+                InlineKeyboardButton("👁  Soft SL  (candle close)",   callback_data="sltype:soft"),
             ],
             [InlineKeyboardButton("✖  Abort trade", callback_data="wizard:cancel")],
         ])
-        sl_str = f"${_fmt(sl)}"
         hdr = f"<b>NEW TRADE</b>  /  Step 7 of 9\n<code>{"=" * 28}</code>\n\n"
         trail = _trail({'pair': d['pair'], 'side': d['_side_label'], 'sl': sl_str})
         body = (
-            f"  <b>SL TIMEFRAME</b>\n\n"
-            f"  Which candle must close beyond <code>{sl_str}</code>?\n"
-            f"  Choose the timeframe for candle-close monitoring:"
+            f"  <b>SL TYPE</b>\n\n"
+            f"  <b>Hard SL</b>  —  placed as an exchange stop order\n"
+            f"  <b>Soft SL</b>  —  alerts you when a candle closes beyond {sl_str}"
         )
         await update.message.reply_text(
             hdr + trail + body,
             parse_mode="HTML", reply_markup=kb,
         )
-        return ASK_SL_TIMEFRAME
+        return ASK_SL_TYPE
+
+
+    @auth_required
+    async def trade_sl_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        sl_type = query.data.split(":")[1]  # "hard" | "soft"
+        d = context.user_data[TRADE_KEY]
+        sl_str = f"${_fmt(d['sl'])}"
+
+        if sl_type == "hard":
+            # Hard SL — no timeframe needed, clear any previous soft sl_timeframe
+            d["sl_timeframe"] = None
+            side = d["side"]
+            tp_hint = "above entry" if side == "long" else "below entry"
+            sl_label = f"{sl_str}  (hard)"
+            hdr = f"<b>NEW TRADE</b>  /  Step 8 of 9\n<code>{'═'*28}</code>\n\n"
+            trail = _trail({'pair': d['pair'], 'side': d['_side_label'], 'sl': sl_label})
+            kb_tp1 = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭  Skip — no TPs", callback_data="tp:skip_all")],
+                [InlineKeyboardButton("✖  Abort trade",   callback_data="wizard:cancel")],
+            ])
+            await query.edit_message_text(
+                hdr + trail +
+                f"  <b>TAKE PROFIT 1</b>  —  {int(get_settings().tp1_pct*100)}% of position\n\n"
+                f"  <i>Must be {tp_hint}.</i>",
+                parse_mode="HTML", reply_markup=kb_tp1,
+            )
+            return ASK_TP1
+
+        else:
+            # Soft SL — ask for timeframe
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("15m",   callback_data="sltf:15m"),
+                    InlineKeyboardButton("30m",   callback_data="sltf:30m"),
+                    InlineKeyboardButton("1h",    callback_data="sltf:1h"),
+                ],
+                [
+                    InlineKeyboardButton("4h",    callback_data="sltf:4h"),
+                    InlineKeyboardButton("Daily", callback_data="sltf:Daily"),
+                ],
+                [InlineKeyboardButton("✖  Abort trade", callback_data="wizard:cancel")],
+            ])
+            hdr = f"<b>NEW TRADE</b>  /  Step 7 of 9\n<code>{'═'*28}</code>\n\n"
+            trail = _trail({'pair': d['pair'], 'side': d['_side_label'], 'sl': sl_str})
+            body = (
+                f"  <b>SL TIMEFRAME</b>\n\n"
+                f"  Which candle must close beyond <code>{sl_str}</code>?\n"
+                f"  Choose the timeframe for candle-close monitoring:"
+            )
+            await query.edit_message_text(
+                hdr + trail + body,
+                parse_mode="HTML", reply_markup=kb,
+            )
+            return ASK_SL_TIMEFRAME
 
     @auth_required
     async def trade_sl_timeframe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
