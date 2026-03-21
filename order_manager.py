@@ -201,13 +201,11 @@ class OrderManager:
                     qty=tp3_qty, price=req.tp3, reduce_only=True, trade_side="CLOSE",
                     position_id=position_id,
                 )
-            if req.sl and req.sl > 0 and not req.sl_timeframe:
-                # Hard SL — place on exchange only when no soft SL timeframe is set
+            if req.sl and req.sl > 0:
                 tpsl_id = await self._client.place_tpsl(
                     symbol=pair, position_id=position_id, sl_price=req.sl,
                 )
             else:
-                # Soft SL (sl_timeframe set) or no SL — no exchange order
                 tpsl_id = ""
         else:
             tp3_order_id_val = ""
@@ -360,8 +358,7 @@ class OrderManager:
                             qty=tp3_qty, price=trade.tp3, reduce_only=True,
                             trade_side="CLOSE", position_id=position_id,
                         )
-                    if trade.sl and trade.sl > 0 and not trade.soft_sl_timeframe:
-                        # Only place hard SL if this is not a soft SL trade
+                    if trade.sl and trade.sl > 0:
                         trade.sl_order_id = await self._client.place_tpsl(
                             symbol=pair, position_id=position_id, sl_price=trade.sl,
                         )
@@ -896,9 +893,9 @@ class OrderManager:
         # Also check DCA fills for trades that already have a position
         dca_pending = [t for t in self._cache.values()
                        if t.position_id and t.dca_order_id]
-        if not pending and not dca_pending:
+        if not pending:
             return
-        logger.debug(f"Entry fill poller: {len(pending)} pending entrie(s), {len(dca_pending)} DCA pending")
+        logger.debug(f"Entry fill poller: {len(pending)} pending entrie(s)")
         for trade in pending:
             pair = trade.pair
             try:
@@ -939,8 +936,7 @@ class OrderManager:
                         qty=tp3_qty, price=trade.tp3, reduce_only=True,
                         trade_side="CLOSE", position_id=position_id,
                     )
-                if trade.sl and trade.sl > 0 and not trade.soft_sl_timeframe:
-                    # Only place hard SL if this is not a soft SL trade
+                if trade.sl and trade.sl > 0:
                     trade.sl_order_id = await self._client.place_tpsl(
                         symbol=pair, position_id=position_id, sl_price=trade.sl,
                     )
@@ -1138,6 +1134,8 @@ class OrderManager:
                     if tp_num == 1 and s.auto_move_sl_to_be and trade.sl != trade.entry:
                         old_sl = trade.sl
                         await self.modify_sl(pair, trade.entry)
+                        # Cancel candle monitoring — no longer needed at breakeven
+                        await self.clear_soft_sl(pair)
                         await self._jnl.log_sl_moved_to_be(trade, old_sl)
                         await notify_callback(
                             f"<b>SL → BREAKEVEN</b>  🔒\n"
@@ -1361,8 +1359,6 @@ class OrderManager:
         )
         return order_id
 
-    # ── /dca — add DCA order with independent risk sizing ────────────────────
-
     async def rebalance_tps(self, pair: str) -> dict:
         """
         Cancel all existing TP orders for a trade and re-place them
@@ -1423,6 +1419,8 @@ class OrderManager:
             f"tp1={tp1_qty} tp2={tp2_qty} tp3={tp3_qty}"
         )
         return {"tp1_qty": tp1_qty, "tp2_qty": tp2_qty, "tp3_qty": tp3_qty, "total_qty": live_qty}
+
+    # ── /dca — add DCA order with independent risk sizing ────────────────────
 
     async def add_dca_order(
         self,

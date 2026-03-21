@@ -1421,6 +1421,7 @@ class BotHandlers:
         Usage:
           /setstrategy PAIR neil
           /setstrategy PAIR saltwayer
+          /setstrategy PAIR sherlock
           /setstrategy PAIR none
         """
         args = context.args or []
@@ -1432,6 +1433,7 @@ class BotHandlers:
                 f"<code>{sep}</code>\n\n"
                 f"  <code>/setstrategy PAIR neil</code>\n"
                 f"  <code>/setstrategy PAIR saltwayer</code>\n"
+                f"  <code>/setstrategy PAIR sherlock</code>\n"
                 f"  <code>/setstrategy PAIR none</code>",
                 parse_mode="HTML",
             )
@@ -1440,10 +1442,10 @@ class BotHandlers:
         pair     = args[0].upper()
         strategy = args[1].lower()
 
-        if strategy not in ("neil", "saltwayer", "none"):
+        if strategy not in ("neil", "saltwayer", "sherlock", "none"):
             await update.message.reply_text(
                 f"<b>INVALID STRATEGY</b>\n\n"
-                f"  Valid options: <code>neil</code>  <code>saltwayer</code>  <code>none</code>",
+                f"  Valid options: <code>neil</code>  <code>saltwayer</code>  <code>sherlock</code>  <code>none</code>",
                 parse_mode="HTML",
             )
             return
@@ -1468,7 +1470,7 @@ class BotHandlers:
                 parse_mode="HTML",
             )
         else:
-            labels = {"neil": "📐 Neil", "saltwayer": "🌊 Saltwayer"}
+            labels = {"neil": "📐 Neil", "saltwayer": "🌊 Saltwayer", "sherlock": "🔍 Sherlock"}
             await update.message.reply_text(
                 f"<b>STRATEGY SET</b>  ✅\n"
                 f"<code>{sep}</code>\n\n"
@@ -1985,7 +1987,7 @@ class BotHandlers:
 
             # Strategy multiplier qty (neil=2×, saltwayer=2.5×)
             strategy   = trade.strategy or ""
-            mult       = 2.0 if strategy == "neil" else (2.5 if strategy == "saltwayer" else None)
+            mult       = 2.0 if strategy == "neil" else (2.5 if strategy == "saltwayer" else (1.0 if strategy == "sherlock" else None))
             mult_label = f"{mult}×" if mult else None
 
             # Option A: lock qty to entry×mult, derive risk

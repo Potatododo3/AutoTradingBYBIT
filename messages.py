@@ -291,9 +291,7 @@ def trade_opened(trade: TradeRecord, debug_mode: bool = False) -> str:
         f"  <code>{'Entry':<12}</code>  ${_fmt(trade.entry)}\n"
         f"  <code>{'Size':<12}</code>  {trade.position_size}\n"
         f"  <code>{'Leverage':<12}</code>  {trade.leverage}×\n"
-        + (f"  <code>{trade.soft_sl_timeframe + ' SL':<12}</code>  ${_fmt(trade.sl)}  <i>(candle monitor)</i>\n"
-           if trade.soft_sl_timeframe else
-           (f"  <code>{'Stop Loss':<12}</code>  ${_fmt(trade.sl)}\n" if trade.sl else ""))
+        f"  <code>{'Soft SL':<12}</code>  ${_fmt(trade.sl)}\n"
         + _tp_opened_line(trade.tp1, trade.tp2, trade.tp3)
         + f"<code>{DIV}</code>\n"
         + f"  <i>Orders placed. Position is live.</i>"
@@ -359,7 +357,7 @@ def positions(pos_list: list[BybitPosition], active_trades: dict, classified: di
         # Strategy — only show if explicitly set on the trade record
         detected_strategy = None
         if trade and trade.strategy:
-            labels = {"neil": "📐 Neil", "saltwayer": "🌊 Saltwayer"}
+            labels = {"neil": "📐 Neil", "saltwayer": "🌊 Saltwayer", "sherlock": "🔍 Sherlock"}
             detected_strategy = labels.get(trade.strategy)
         strategy_row = f"  <code>{'Strategy':<12}</code>  {detected_strategy}\n" if detected_strategy else ""
 
